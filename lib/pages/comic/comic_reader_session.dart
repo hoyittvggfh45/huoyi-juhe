@@ -5,6 +5,20 @@ part of '../comic_reader_page.dart';
 /// 从 `comic_reader_page.dart` 拆出的 part，和 `reader_page.dart` 的
 /// `reader/reader_page_progress.dart` 同一组织方式：这里只搬代码，行为不变。
 extension _ComicReaderSession on _ComicReaderPageState {
+  /// Remote-first manga fetch (user routing rule, 2026-11-28): the A4m
+  /// remote path is tried first for pilot books; any failure falls back to
+  /// the local Fanqie official-direct path ([ApiClient.comicImages], whose
+  /// images are decrypted inside the Rust core). The switch itself lives in
+  /// [ApiClient.remoteFirstComicImages] so it is unit-testable.
+  Future<List<ComicImage>> _remoteFirstComicImages(Chapter chapter) {
+    return _api.remoteFirstComicImages(
+      widget.bookId,
+      chapter.itemId,
+      localFetch: () =>
+          _api.comicImages(chapter.itemId, bookId: widget.bookId),
+    );
+  }
+
   /// 记住目录，让「最近阅读/书架」下次能跳过详情页直接进漫画。
   ///
   /// 写入失败不影响阅读：拿不到目录最多是下次仍走详情页。
@@ -52,15 +66,14 @@ extension _ComicReaderSession on _ComicReaderPageState {
     try {
       _imageRequest?.cancel();
       final request = _imageRequest = BackendRequest();
-      final images = await ApiClient.instance.withCancellation(
-        request,
-        () async =>
-            await (widget.chapterLoader?.call(chapter) ??
-                ApiClient.instance.comicImages(
-                  chapter.itemId,
-                  bookId: widget.bookId,
-                )),
-      );
+      final images = await _api.withCancellation(request, () async {
+        final loader = widget.chapterLoader;
+        if (loader != null) return loader(chapter);
+        if (_api.usesMangaPilot(widget.bookId)) {
+          return _remoteFirstComicImages(chapter);
+        }
+        return _api.comicImages(chapter.itemId, bookId: widget.bookId);
+      });
       if (!mounted || generation != _loadGeneration) return;
       if (images.isEmpty) throw const ApiException('本章暂无可阅读图片');
       final saved = await history;

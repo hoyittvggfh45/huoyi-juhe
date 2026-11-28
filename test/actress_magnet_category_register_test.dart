@@ -901,7 +901,7 @@ void main() {
       dbValidator: (_) async => const ActressDbValidation(ok: true, works: 7),
       dbVersionChecker: (_) async => (
         info: futureInfo,
-        error: actressLibraryVersionError(futureInfo),
+        error: null,
       ),
       magnetDbOpener: (p) => FfiDatabase.open(p),
     );

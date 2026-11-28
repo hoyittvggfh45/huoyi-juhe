@@ -176,10 +176,14 @@ List<({String id, String name})> visibleVideoZoneSites(
 /// 进内置区，第四路用户导入站进导入区（按来源集判，不查登记行
 /// 的 `builtin` 标记，撞 id 时内置优先）；插件站（kind=idjPlugin）
 /// 进插件区（用户 2026-11-26 令新增第三区）。
-/// 组：午夜 jar 站与内置导入视频站进「午夜」组，核心影视站与
-/// 用户导入的影视站进「视频」组（用户站不在 midnightIds 里，
-/// 自动落视频组；区则由 customById 查到且 `builtin != true`
-/// 判定为导入区）。
+/// 组：导入区/插件区沿用老口径（午夜 jar 站与内置导入视频站进
+/// 「午夜」组，其余进「视频」组）。**内置区自 2026-11-28 起按
+/// 内容自动分类**（用户令「639 站点列表分类」）：非成人视频站
+/// 归「影视」组，成人影视按来源形态二级拆 Python / Jar / 书源 /
+/// 其他四组（规则见 services/site_category.dart 与
+/// [builtinVideoCategoryGroup]）；分类只对已通过分档门禁的可见
+/// 站排版，不改可见性——未解锁的成人站在组表前已被
+/// [visibleVideoZoneSites] 拦掉，分类不会把它们带回来。
 /// 已在站源管理里关掉的内置站（`isBuiltinEnabled==false`）不列出；
 /// 隐藏只认归一化后的核心站 id（`adultSiteIdForUnifiedId`）：种子行
 /// `seed_x` / jar 行 `jar:...:Key` 与裸站行 `x` 是同一站，站源管理里
@@ -205,11 +209,25 @@ List<SiteGridEntry> videoZoneSiteEntries(
   final builtinIds = <String>{
     for (final site in videoZoneSites()) site.id,
     ...midnightIds,
+    // 包内打包站点库的行（sqlManaged + bundled 标记）：站点已
+    // 随包内置直显，计入内置区（2026-11-28 取消激活令）。用户
+    // 自导的 sqlManaged 行没有 bundled 标记，仍进导入区。
+    for (final entry in customEntries)
+      if (entry.extra['sqlManaged'] == true &&
+          entry.extra['bundled'] == true)
+        entry.id,
   };
   final pluginIds = <String>{
     for (final entry in customEntries)
       if (entry.kind == SourceKind.idjPlugin) entry.id,
   };
+  final customById = <String, SourceEntry>{
+    for (final entry in customEntries) entry.id: entry,
+  };
+  final midnightJarIds = <String>{
+    for (final entry in midnightJarVideoSites(customEntries)) entry.id,
+  };
+  final adultOrderIds = adultVideoSiteOrder.toSet();
   final entries = <SiteGridEntry>[];
   for (final site in visibleVideoZoneSites(customEntries, xp)) {
     final zone = pluginIds.contains(site.id)
@@ -225,12 +243,56 @@ List<SiteGridEntry> videoZoneSiteEntries(
       id: site.id,
       name: site.name,
       zone: zone,
-      group: midnightIds.contains(site.id)
+      group: zone == SiteGridZone.builtin
+          ? builtinVideoCategoryGroup(
+              id: site.id,
+              entry: customById[site.id],
+              isMidnightJar: midnightJarIds.contains(site.id),
+              inAdultOrder: adultOrderIds.contains(
+                adultSiteIdForUnifiedId(site.id),
+              ),
+            )
+          : midnightIds.contains(site.id)
           ? SiteGridGroup.midnight
           : SiteGridGroup.video,
     ));
   }
   return entries;
+}
+
+/// 内置区一个视频站的自动分类组（纯函数，可单测）：
+///
+/// 成人判定优先级：登记行自带的 `extra['isAdult']`（站点库行在
+/// [buildSqlSiteEntries] 时写入，库内标记是第一手口径）→ 午夜
+/// jar 集（午夜 jar 站按定义是成人站）→ 旧成人分档表
+/// （[adultVideoSiteOrder]，核心站的老口径）。三者都不命中才算
+/// 非成人。注意这只决定**排版分组**：可见性（分档门禁）在
+/// [visibleVideoZoneSites] 已先行过滤，本函数碰不到未解锁的站。
+///
+/// 非成人 → [SiteGridGroup.film]（影视）；成人 → 按来源形态二级
+/// 拆组：登记行 kind 优先（pyImport / jarImport / legadoImport），
+/// 无登记行时按 id 形态回落（`seed_` 前缀是 Python 种子站、
+/// `jar:` 前缀是 Jar 站），都判不出落「成人影视 · 其他」。
+SiteGridGroup builtinVideoCategoryGroup({
+  required String id,
+  required SourceEntry? entry,
+  required bool isMidnightJar,
+  required bool inAdultOrder,
+}) {
+  final adult =
+      entry?.extra['isAdult'] == true || isMidnightJar || inAdultOrder;
+  if (!adult) return SiteGridGroup.film;
+  final kind = entry?.kind;
+  if (kind == SourceKind.pyImport || id.startsWith('seed_')) {
+    return SiteGridGroup.adultFilmPy;
+  }
+  if (kind == SourceKind.jarImport || id.startsWith('jar:')) {
+    return SiteGridGroup.adultFilmJar;
+  }
+  if (kind == SourceKind.legadoImport) {
+    return SiteGridGroup.adultFilmBook;
+  }
+  return SiteGridGroup.adultFilmOther;
 }
 
 /// 推荐页全局「影视」区的可见站表（纯函数，可单测）：视频站与

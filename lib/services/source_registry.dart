@@ -299,7 +299,14 @@ bool isMidnightJarBuiltin(SourceEntry entry) {
 /// jar: 形态，与旧 ensure* 产出一致，老墓碑/禁用键无缝衔接）；
 /// 只动 extra['sqlManaged'] == true 的行由 syncSqlSites 负责。
 /// 代码本体不进 extra（只存路径指针，见评估报告第 2 节铁律）。
-List<SourceEntry> buildSqlSiteEntries(List<SiteLibraryStation> stations) {
+/// [bundled] 为真（当前装载的是包内打包站点库）时给每行加
+/// `extra['bundled']=true` 标记，影视区分区据此把打包站计入
+/// 内置区；不改 `builtin`（会撞 load() 一次性迁移摘行与第四
+/// 路排除逻辑）。
+List<SourceEntry> buildSqlSiteEntries(
+  List<SiteLibraryStation> stations, {
+  bool bundled = false,
+}) {
   final entries = <SourceEntry>[];
   for (final station in stations) {
     final rawType = station.contentType;
@@ -328,7 +335,12 @@ List<SourceEntry> buildSqlSiteEntries(List<SiteLibraryStation> stations) {
               'contentType': contentType,
               'builtin': false,
               'sqlManaged': true,
+              if (bundled) 'bundled': true,
               'sqlCanon': station.canonId,
+              // 站点库自带的成人标记：内置站自动分类（site_category）
+              // 以此为准，不靠旧成人分档表反推（两边口径有差，见
+              // xiuxian_station_list_cats_20261128 报告）。
+              'isAdult': station.isAdult,
               if (kind == SourceKind.legadoImport) 'hasExplore': true,
               if (verifyNote != null && verifyNote.isNotEmpty)
                 'verifyNote': verifyNote,
@@ -359,7 +371,12 @@ List<SourceEntry> buildSqlSiteEntries(List<SiteLibraryStation> stations) {
               'contentType': contentType,
               'builtin': false,
               'sqlManaged': true,
+              if (bundled) 'bundled': true,
               'sqlCanon': station.canonId,
+              // 站点库自带的成人标记：内置站自动分类（site_category）
+              // 以此为准，不靠旧成人分档表反推（两边口径有差，见
+              // xiuxian_station_list_cats_20261128 报告）。
+              'isAdult': station.isAdult,
               if (verifyNote != null && verifyNote.isNotEmpty)
                 'verifyNote': verifyNote,
             },
@@ -386,6 +403,7 @@ class SourceRegistry {
   /// 用注入值代替 SiteLibraryService 单例（生产恒为 null）。
   List<SiteLibraryStation>? debugSqlStationsOverride;
   bool? debugSqlImportedOverride;
+  bool? debugSqlBundledOverride;
   bool Function(String siteId)? debugGatedNativeOverride;
 
   /// 测试专用重置：清掉已加载状态与全部登记行，让单测能模拟
@@ -399,6 +417,7 @@ class SourceRegistry {
     _sqlMigrationRemoved = false;
     debugSqlStationsOverride = null;
     debugSqlImportedOverride = null;
+    debugSqlBundledOverride = null;
     debugGatedNativeOverride = null;
   }
 
@@ -1585,19 +1604,23 @@ class SourceRegistry {
       await load();
       final List<SiteLibraryStation> stations;
       final bool imported;
+      final bool bundled;
       if (debugSqlStationsOverride != null ||
-          debugSqlImportedOverride != null) {
+          debugSqlImportedOverride != null ||
+          debugSqlBundledOverride != null) {
         stations = debugSqlStationsOverride ?? const [];
         imported = debugSqlImportedOverride ?? false;
+        bundled = debugSqlBundledOverride ?? false;
       } else {
         await SiteLibraryService.instance.load();
         imported = SiteLibraryService.instance.imported;
+        bundled = SiteLibraryService.instance.isBundledLoad;
         stations = SiteLibraryService.instance.stations;
       }
       final wanted = <String, SourceEntry>{};
       if (imported) {
         final oldById = {for (final entry in _custom) entry.id: entry};
-        for (final entry in buildSqlSiteEntries(stations)) {
+        for (final entry in buildSqlSiteEntries(stations, bundled: bundled)) {
           final old = oldById[entry.id];
           var merged = entry;
           // 分类提取后来补进 extra 的真实分类不因对账丢失。
@@ -1665,6 +1688,7 @@ class SourceRegistry {
       'contentType',
       'builtin',
       'sqlManaged',
+      'bundled',
       'sqlCanon',
       'hasExplore',
       'verifyNote',

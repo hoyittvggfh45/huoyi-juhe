@@ -1045,7 +1045,6 @@ INSERT INTO video_category VALUES ('aaa-001', '4K原版');
       final importer = ActressSqlImporter(
         executorFactory: (tempPath) async =>
             SqfliteImportExecutor(await FfiDatabase.open(tempPath)),
-        versionGate: (_) async => null,
       );
       final stagingPath = path.join(_dir.path, 'staging_${_seq++}.db');
       final outcome = await buildMagnetStagingDb(

@@ -52,10 +52,12 @@ void main() {
     }
   });
 
-  test('真果鉴 6 站按登记顺序追加在成人分档表末尾', () {
-    final tail = adultVideoSiteOrder
-        .sublist(adultVideoSiteOrder.length - newStations.length);
-    expect(tail, newStations.keys.toList());
+  test('真果鉴 6 站按登记顺序追加在成人分档表里（原表尾位置）', () {
+    // 本批落表时 6 站就在表尾（下标 275～280）；2026-11-28 对齐
+    // 补齐又在其后追加 96 站，6 站位置不变、只是不再居表尾，
+    // 故按原下标断言连续同序。
+    final segment = adultVideoSiteOrder.sublist(275, 281);
+    expect(segment, newStations.keys.toList());
     for (final id in newStations.keys) {
       expect(adultTierForSiteId(id, adultVideoSiteOrder), isNotNull,
           reason: id);

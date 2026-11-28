@@ -49,6 +49,9 @@ const _refreshUrl = 'https://user-njs.yun.139.com/user/auth/refreshToken';
 const _mineListUrl = 'https://personal-kd-njs.yun.139.com/hcy/file/list';
 const _mineDownloadUrl =
     'https://personal-kd-njs.yun.139.com/hcy/file/getDownloadUrl';
+const _mineCreateUrl = 'https://personal-kd-njs.yun.139.com/hcy/file/create';
+const _mineMoveUrl =
+    'https://personal-kd-njs.yun.139.com/hcy/file/batchMove';
 const _captchaPageBase = 'https://yun.139.com/fe/captcha/?data=';
 const _mineListFields =
     'thumbnailUrls,addressDetail,mediaMetaInfo,metadataAuditInfo,userTags,'
@@ -1294,6 +1297,79 @@ class Yun139Provider implements CloudDriveProvider {
   ) async {
     // 移动云盘个人盘没有站方搜索接口，走引擎的“取列表后按名过滤”兜底。
     throw UnsupportedError('移动云盘没有站方搜索接口');
+  }
+
+  /// 建夹：POST hcy/file/create，{parentFileId, name,
+  /// description:'', type:'folder'}（与本文件列表/直链同一
+  /// hcy 个人盘接口族、同一 Authorization 体系；形态据同
+  /// 源协议的公开实现核实）。回包 data.fileId 即新文件夹。
+  @override
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  ) async {
+    final fresh = await _ensureFresh(client, credentials);
+    final device = _deviceFromCredentials(fresh);
+    final result = await _postJsonMap(
+      client,
+      _mineCreateUrl,
+      {
+        'parentFileId': parentId,
+        'name': name,
+        'description': '',
+        'type': 'folder',
+      },
+      _listHeaders(fresh, device),
+      '移动云盘创建文件夹',
+      timeout: _dataTimeout,
+    );
+    final data = result['data'];
+    if (result['success'] != true || data is! Map<String, dynamic>) {
+      throw CloudDriveException(_messageOf(result, '移动云盘创建文件夹失败'));
+    }
+    final parsed = _parseListItem(data);
+    if (parsed != null) return parsed;
+    final fileId = _asString(data['fileId']);
+    if (fileId.isEmpty) {
+      throw CloudDriveException('移动云盘创建文件夹失败：没有返回新文件夹 id');
+    }
+    return CloudDriveFile(
+      id: fileId,
+      name: name,
+      isFolder: true,
+      kind: CloudFileKind.folder,
+    );
+  }
+
+  /// 移动：POST hcy/file/batchMove，{fileIds:[本文件],
+  /// toParentFileId}（批量接口单条用，与建夹同一接口族）。
+  /// success 为真才算服务端确认完成。
+  @override
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  }) async {
+    final fresh = await _ensureFresh(client, credentials);
+    final device = _deviceFromCredentials(fresh);
+    final result = await _postJsonMap(
+      client,
+      _mineMoveUrl,
+      {
+        'fileIds': [file.id],
+        'toParentFileId': targetFolderId,
+      },
+      _listHeaders(fresh, device),
+      '移动云盘移动文件',
+      timeout: _dataTimeout,
+    );
+    if (result['success'] != true) {
+      throw CloudDriveException(_messageOf(result, '移动云盘移动文件失败'));
+    }
   }
 
   @override

@@ -7,7 +7,6 @@ import 'package:sqflite/sqflite.dart';
 import '../services/import_debug_log.dart';
 import '../services/sql_text_stream.dart';
 import 'actress_generic_db.dart';
-import 'actress_library_version.dart';
 
 /// 女优库 .sql 导入（2026-11-25 用户令）：把女优库.db 改成 .sql 后，
 /// 从演员库设置里选 .sql / .sql.gz 文件导回手机，导完直接当主库用。
@@ -17,10 +16,9 @@ import 'actress_library_version.dart';
 /// 先到先 flush）→ 字段归一化（标准库直接过；
 /// 字段不一样的库按字段名宽容映射建成标准表，见 _normalizeImport）
 /// → 校验三项（作品数/播放地址大于 0；人数可为 0 只警告）
-/// → 版本门（2026-11-27 激活批：临时库 schema_meta 的版本字段
-/// 必须与当前软件对得上，见 actress_library_version.dart；
-/// 缺字段/对不上整单拒、原库一字不动）
 /// → 关主库连接 → 备份现库为 .bak → 临时库改名顶替主库。
+/// 数据库版本门已全拆（2026-11-28 用户令）：schema_meta 的
+/// 版本字段缺失或写任意值都不拒收，导入只剩结构校验。
 /// 校验不过、取消、执行出错都在换库之前停下：原库一字不动，
 /// 临时文件删掉。
 ///
@@ -215,40 +213,12 @@ class SqfliteImportExecutor implements SqlImportExecutor {
 /// “已取消，数据库未改动”收尾。
 class ActressSqlImportCancelled implements Exception {}
 
-/// 版本门拒收：message 是可直接上屏的中文原因（不套「导入
-/// 失败：」前缀，与其它执行错误分开呈现）。
-class ActressSqlImportRejected implements Exception {
-  const ActressSqlImportRejected(this.message);
-
-  final String message;
-
-  @override
-  String toString() => message;
-}
-
-/// 版本门判定：给临时库执行器，回中文拒收原因（null = 通过）。
-/// 测试可注入假件；默认走 [actressLibraryVersionError] 真判定。
-typedef ActressSqlVersionGate = Future<String?> Function(
-  SqlImportExecutor executor,
-);
-
-/// 默认版本门：读临时库 schema_meta 按女优库版本规格判定。
-Future<String?> defaultActressSqlVersionGate(
-  SqlImportExecutor executor,
-) async {
-  final info = await readActressLibraryVersion(
-    (sql) => executor.query(sql),
-  );
-  return actressLibraryVersionError(info);
-}
-
 /// 女优库 .sql 导入器。
 class ActressSqlImporter {
   ActressSqlImporter({
     this.batchSize = 2000,
     this.batchByteLimit = 512 * 1024,
     Future<SqlImportExecutor> Function(String tempPath)? executorFactory,
-    ActressSqlVersionGate? versionGate,
   }) : _executorFactory =
            executorFactory ??
            ((tempPath) async {
@@ -257,8 +227,7 @@ class ActressSqlImporter {
                singleInstance: false,
              );
              return SqfliteImportExecutor(db);
-           }),
-       _versionGate = versionGate ?? defaultActressSqlVersionGate;
+           });
 
   /// 每批 INSERT 条数上限：2000 条一个事务，失败只丢一批、进度可续报。
   final int batchSize;
@@ -269,9 +238,6 @@ class ActressSqlImporter {
   final int batchByteLimit;
 
   final Future<SqlImportExecutor> Function(String tempPath) _executorFactory;
-
-  /// 版本门（校验后、换库前执行；拒收时原库不动、临时库删）。
-  final ActressSqlVersionGate _versionGate;
 
   static const _requiredTables = {
     'videos',
@@ -473,13 +439,6 @@ class ActressSqlImporter {
         ),
       );
       final counts = await _validate(executor);
-      // 版本门（2026-11-27 激活批）：临时库的版本字段必须与当前
-      // 软件对得上，缺字段/对不上整单拒——还在临时库上，原库
-      // 一字不动、临时文件由 finally 清掉。
-      final versionError = await _versionGate(executor);
-      if (versionError != null) {
-        throw ActressSqlImportRejected(versionError);
-      }
       final warnings = <String>[];
       if (counts.covers == 0) warnings.add('导入的库里没有封面');
       if (counts.avatars == 0) warnings.add('导入的库里没有头像');
@@ -526,12 +485,6 @@ class ActressSqlImporter {
         skipped: skipped,
         warnings: warnings,
         needsReload: true,
-      );
-    } on ActressSqlImportRejected catch (e) {
-      return ActressSqlImportResult(
-        ok: false,
-        error: e.message,
-        needsReload: closedDb,
       );
     } on ActressSqlImportCancelled {
       return ActressSqlImportResult(

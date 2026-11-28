@@ -579,15 +579,15 @@ Future<void> runAdversarialCase({
   );
   expect(outcome, isNotNull);
   expect(outcome!.ok, isTrue, reason: '[$label] ${outcome.error}');
-  expect(outcome.stationCount, 1);
+  // 站点段落位已取消（2026-11-28 站点回包内置）：站数恒 0、
+  // 段结果报已跳过、站点库落点文件一字不动；本组的对抗主旨
+  // （任意分块交付下整链不死、演员/磁力段计数对）不变。
+  expect(outcome.stationCount, 0);
   expect(outcome.segmentResults.every((r) => r.ok), isTrue);
-  // Site segment landed: old db replaced by a real SQLite file.
-  final siteBytes = await File(siteDbPath).readAsBytes();
-  expect(siteBytes.length, greaterThan(100));
-  expect(
-    String.fromCharCodes(siteBytes.take(15)),
-    'SQLite format 3'.substring(0, 15),
-  );
+  final siteResult = outcome.segmentResults
+      .firstWhere((r) => r.segment == 'site');
+  expect(siteResult.detail, contains('已跳过'));
+  expect(await File(siteDbPath).readAsString(), 'OLDDB');
 }
 
 void main() {

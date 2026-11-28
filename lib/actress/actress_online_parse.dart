@@ -157,6 +157,22 @@ String phListUrl({
   return '$phSite/video${qs.isEmpty ? '' : '?${qs.join('&')}'}';
 }
 
+/// PH 查无此物时的 404 模板页签名：HTTP 404、标题「没发现
+/// 页面」、正文 1MB 全是推荐位（火蚁 2026-11-28 实拉定性）。
+/// 这是「未找到」不是取数失败——判读只认 <title> 签名、只在
+/// PH 源内用，不动全局 HTTP 口径（凡人 ContentHttp 本就不按
+/// 状态码抛错，404 正文会直接流进解析，不判就会把 60 条推
+/// 荐位冒充搜索结果）。
+bool phIsNotFoundPage(String htmlText) {
+  final match = RegExp(
+    r'<title[^>]*>(.*?)</title>',
+    dotAll: true,
+    caseSensitive: false,
+  ).firstMatch(htmlText);
+  final title = match?.group(1) ?? '';
+  return title.contains('没发现页面') || title.contains('Page Not Found');
+}
+
 bool _isPhVideoUrl(String href) => href.contains('view_video.php?viewkey=');
 
 /// PH 列表卡片：带 viewkey 的链接里有缩略图的才算卡（与合并页

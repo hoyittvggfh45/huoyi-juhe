@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../cloud_drive/cloud_drive_screen.dart';
+import '../cloud_drive/cloud_multimedia_body.dart';
 import '../models/home_cell.dart';
 import '../models/media_item.dart';
 import '../services/api_client.dart';
@@ -1018,13 +1018,19 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   List<Widget> _contentSlivers(HomeState state, double gridWidth) {
-    // 网盘档：不画书城流与其余分类的内容，内容区直接渲染网盘页
-    // 主体（与独立网盘页共用 CloudDriveBody 的嵌入形态）。
+    // 网盘档：不画书城流与其余分类的内容，内容区直接渲染网盘
+    // 多媒体主体（海报墙浏览已登录网盘，对齐主聊魔蚁多媒体网盘；
+    // 登录/凭证/上传/离线管理仍在 CloudDriveScreen，从主体里的
+    // 「管理」按钮与未登录空态进入）。主体自带内部滚动（网格），
+    // 用 SliverFillRemaining 给它剩余视口高度，不套娃滚动。
     if (state.tabIndex >= 0 &&
         state.tabIndex < homeCategories.length &&
         homeCategories[state.tabIndex].label == panHomeCategoryLabel) {
       return const [
-        SliverToBoxAdapter(child: CloudDriveBody(embedded: true)),
+        SliverFillRemaining(
+          hasScrollBody: true,
+          child: CloudMultimediaBody(),
+        ),
       ];
     }
     // 选了有取数客户端的外站时，短剧页不再画原站首页流，改画该站列表；

@@ -27,6 +27,7 @@ class ActressInlinePlayer extends StatefulWidget {
     super.key,
     required this.url,
     this.poster = '',
+    this.title = '',
     this.playerFactory,
     this.onPlaybackError,
     this.onFullscreen,
@@ -36,6 +37,9 @@ class ActressInlinePlayer extends StatefulWidget {
 
   /// 已备好的可播地址（裸直链或本地代理地址）。
   final String url;
+
+  /// 作品标识（番号/标题）：只给画中画悬浮窗当标签用，可空。
+  final String title;
 
   /// 起播前/失败时垫底显示的海报地址。
   final String poster;
@@ -62,7 +66,8 @@ class ActressInlinePlayer extends StatefulWidget {
   State<ActressInlinePlayer> createState() => _ActressInlinePlayerState();
 }
 
-class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
+class _ActressInlinePlayerState extends State<ActressInlinePlayer>
+    with WidgetsBindingObserver {
   NativePlayer? _player;
   final _subs = <StreamSubscription<dynamic>>[];
   int? _textureId;
@@ -94,11 +99,86 @@ class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
   /// 横滑起点：先证明横向主导才接管，避免竖着划详情页时误触快进。
   Offset? _swipeOrigin;
 
+  /// 画中画（悬浮窗）所有者 id：接通后非空；回前台、换线路、进
+  /// 全屏、控件销毁时收掉（与片库内嵌同一套悬浮窗服务与口径）。
+  int? _pipOwner;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_loadRate());
     _start();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _pipOwner != null) {
+      unawaited(_stopPip());
+    }
+  }
+
+  Future<void> _stopPip() async {
+    final owner = _pipOwner;
+    _pipOwner = null;
+    if (owner != null) await NativePlayer.stopFloating(owner);
+  }
+
+  /// 画中画：把当前播放器搬进系统悬浮小窗（本应用既有悬浮窗服务）。
+  /// 要悬浮窗权限：没有就打开系统设置页并给一句实话，不假装已进。
+  Future<void> _enterPip() async {
+    final player = _player;
+    if (player == null || _error != null || !_firstFrame) {
+      _pipSnack('先开始播放，再用画中画');
+      return;
+    }
+    if (_pipOwner != null) {
+      _pipSnack('已经在画中画小窗里播放了');
+      return;
+    }
+    final playerId = player.playerId;
+    if (playerId == null) {
+      _pipSnack('播放器还没就绪，画中画用不了');
+      return;
+    }
+    try {
+      if (!await NativePlayer.canDrawOverlays()) {
+        await NativePlayer.requestOverlayPermission();
+        _pipSnack('画中画需要悬浮窗权限：在系统设置里允许后，再点一次画中画');
+        return;
+      }
+      final owner = await NativePlayer.allocateFloatingOwner();
+      await NativePlayer.startFloating(
+        owner: owner,
+        playerId: playerId,
+        title: widget.title,
+        episode: '',
+        playing: _playing,
+        hasPrev: false,
+        hasNext: false,
+        positionMs: _position.inMilliseconds,
+        durationMs: _duration.inMilliseconds,
+        speed: _rate,
+        videoWidth: player.videoWidth,
+        videoHeight: player.videoHeight,
+      );
+      await NativePlayer.showFloating(owner);
+      if (!mounted) {
+        await NativePlayer.stopFloating(owner);
+        return;
+      }
+      _pipOwner = owner;
+      _showControls();
+    } catch (_) {
+      _pipSnack('画中画启动失败，这台设备可能不支持悬浮窗');
+    }
+  }
+
+  void _pipSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _loadRate() async {
@@ -130,6 +210,10 @@ class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
   @override
   void dispose() {
     _stamp++;
+    WidgetsBinding.instance.removeObserver(this);
+    final pipOwner = _pipOwner;
+    _pipOwner = null;
+    if (pipOwner != null) unawaited(NativePlayer.stopFloating(pipOwner));
     _loadTimer?.cancel();
     _hideTimer?.cancel();
     _teardownPlayer();
@@ -148,6 +232,8 @@ class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
 
   Future<void> _start() async {
     final stamp = ++_stamp;
+    // 换线路会重建播放器：悬浮小窗还占着旧实例时先收窗。
+    unawaited(_stopPip());
     _loadTimer?.cancel();
     _teardownPlayer();
     final startAt = widget.startPosition ?? Duration.zero;
@@ -367,6 +453,7 @@ class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
     final callback = widget.onFullscreen;
     if (callback == null || _error != null) return;
     final position = _position;
+    unawaited(_stopPip());
     _stamp++;
     _loadTimer?.cancel();
     _teardownPlayer();
@@ -562,6 +649,20 @@ class _ActressInlinePlayerState extends State<ActressInlinePlayer> {
                       child: Text(
                         '${_rate == _rate.roundToDouble() ? _rate.toInt() : _rate}x',
                         style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                    SizedBox.square(
+                      dimension: 36,
+                      child: IconButton(
+                        key: const ValueKey('inline-player-pip'),
+                        tooltip: '画中画',
+                        onPressed: () => unawaited(_enterPip()),
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(
+                          Icons.picture_in_picture_alt_rounded,
+                          color: Colors.white,
+                          size: 19,
+                        ),
                       ),
                     ),
                     if (widget.onFullscreen != null)

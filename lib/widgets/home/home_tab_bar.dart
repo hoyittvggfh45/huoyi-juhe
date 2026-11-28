@@ -138,23 +138,86 @@ class HomeTabBarDelegate extends SliverPersistentHeaderDelegate {
             height: rowHeight,
             child: LayoutBuilder(
               builder: (context, constraints) {
-                final gap = _gapWidth(context, constraints.maxWidth, palette);
-                return SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: sidePadding),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (
-                        var index = 0;
-                        index < categories.length;
-                        index++
-                      ) ...[
-                        if (index > 0) SizedBox(width: gap),
-                        _tab(index, rowHeight, duration, palette),
-                      ],
+                // 网盘档不进横滑区：钉在分类行右端固定显示（用户
+                // 2026-11-28 令「把网盘添加到右上角分类旁边」——此前
+                // 它是第八档，手机上被挤出右缘只露半个字）。下标与
+                // 选中语义仍按全表走（home_provider 按标签对位），
+                // 滚动区只是不再画它，行里不会出现两个网盘入口。
+                final panIndex = categories.indexWhere(
+                  (c) => c.label == panHomeCategoryLabel,
+                );
+                final scrollIndices = [
+                  for (var i = 0; i < categories.length; i++)
+                    if (i != panIndex) i,
+                ];
+                // 固定钮占的宽度：网盘两字在未选中字号下的宽 + 左右
+                // 留白与分隔线，让滚动区的间隔平摊只算剩下的空间。
+                var panReserve = 0.0;
+                if (panIndex >= 0) {
+                  final painter = TextPainter(
+                    text: TextSpan(
+                      text: categories[panIndex].label,
+                      style: _labelStyle(false, palette),
+                    ),
+                    textDirection: Directionality.of(context),
+                    textScaler: MediaQuery.textScalerOf(context),
+                    maxLines: 1,
+                  )..layout();
+                  panReserve = painter.width + 10 + 1 + 8;
+                  painter.dispose();
+                }
+                final gap = _gapWidth(
+                  context,
+                  constraints.maxWidth - panReserve,
+                  palette,
+                  [for (final i in scrollIndices) categories[i]],
+                );
+                return Row(
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        padding: EdgeInsets.only(
+                          left: sidePadding,
+                          right: panIndex >= 0 ? 4 : sidePadding,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            for (
+                              var pos = 0;
+                              pos < scrollIndices.length;
+                              pos++
+                            ) ...[
+                              if (pos > 0) SizedBox(width: gap),
+                              _tab(
+                                scrollIndices[pos],
+                                rowHeight,
+                                duration,
+                                palette,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (panIndex >= 0) ...[
+                      Container(
+                        width: 1,
+                        height: 22,
+                        color: dark
+                            ? Colors.white24
+                            : palette.muted.withValues(alpha: 0.35),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(
+                          left: 10,
+                          right: sidePadding,
+                        ),
+                        child: _tab(panIndex, rowHeight, duration, palette),
+                      ),
                     ],
-                  ),
+                  ],
                 );
               },
             ),
@@ -175,8 +238,9 @@ class HomeTabBarDelegate extends SliverPersistentHeaderDelegate {
     BuildContext context,
     double availableWidth,
     HomePalette palette,
+    List<HomeCategory> scrollCategories,
   ) {
-    final gaps = categories.length - 1;
+    final gaps = scrollCategories.length - 1;
     if (gaps <= 0 || !availableWidth.isFinite) return tabSpacing;
 
     // 每个 tab 的宽度就是它那行字的宽度（Center 在 Row 里收缩包裹），用同一个
@@ -184,11 +248,14 @@ class HomeTabBarDelegate extends SliverPersistentHeaderDelegate {
     final scaler = MediaQuery.textScalerOf(context);
     final textDirection = Directionality.of(context);
     var contentWidth = 0.0;
-    for (var index = 0; index < categories.length; index++) {
+    for (final category in scrollCategories) {
       final painter = TextPainter(
         text: TextSpan(
-          text: categories[index].label,
-          style: _labelStyle(index == selectedIndex, palette),
+          text: category.label,
+          style: _labelStyle(
+            categories.indexOf(category) == selectedIndex,
+            palette,
+          ),
         ),
         textDirection: textDirection,
         textScaler: scaler,

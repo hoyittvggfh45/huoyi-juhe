@@ -1,7 +1,8 @@
 // 演员库激活批预览（2026-11-27）：一测一张，输出 PNG 到
 // ~/workspace/xiuxian_actress_activation_20261127/previews/。
-// 两张：①数据库管理页未激活引导态；②点外置「导入激活」被
-// 版本门拒后的中文原因提示态。注入假来源/假校验，不碰真库。
+// 两张：①数据库管理页未激活引导态；②管理页新口径验收态
+// （2026-11-28 取消激活/拆版本门后：无站点卡、页面无「版本」
+// 字样）。注入假来源/假校验，不碰真库。
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -98,34 +99,24 @@ void main() {
     await _savePng(tester, 'preview_unactivated_guide.png');
   });
 
-  testWidgets('预览2：版本不符提示', (tester) async {
-    // 2026-11-28 取消核心门后，版本不符只剩格式版本：用格式
-    // 版本 2 造不符（核心版本写什么都不再拒）。
+  testWidgets('预览2：管理页无站点卡、无版本字样', (tester) async {
+    // 2026-11-28 新口径：站点已随包内置，管理页删站点卡；
+    // 数据库版本彻底取消，页面任何地方不许再出现「版本」。
     await pumpManage(
       tester,
       versionChecker: (_) async => (
         info: const ActressLibraryVersionInfo(
           format: 'actress_library',
-          formatVersion: '2',
-          coreVersion: '2027.01.01',
-          libraryVersion: '20270101',
+          formatVersion: '1',
+          coreVersion: '2026.11.27',
+          libraryVersion: '20261127v5',
         ),
-        error: actressLibraryVersionError(
-          const ActressLibraryVersionInfo(
-            format: 'actress_library',
-            formatVersion: '2',
-            coreVersion: '2027.01.01',
-            libraryVersion: '20270101',
-          ),
-        ),
+        error: null,
       ),
     );
-    await tester.tap(find.byKey(const ValueKey('dual-import-external')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 50));
-    await tester.pump();
-    expect(find.byKey(const ValueKey('dual-error')), findsOneWidget);
-    expect(find.textContaining('格式版本 2'), findsWidgets);
-    await _savePng(tester, 'preview_version_mismatch.png');
+    expect(find.text('站点（随数据库激活）'), findsNothing);
+    expect(find.byKey(const ValueKey('site-library-card')), findsNothing);
+    expect(find.textContaining('版本'), findsNothing);
+    await _savePng(tester, 'preview_no_site_card_no_version.png');
   });
 }

@@ -330,6 +330,28 @@ abstract class CloudDriveProvider {
     CloudDriveFile file,
   );
 
+  /// 在 [parentId] 文件夹下新建名为 [name] 的文件夹，返回新建
+  /// 文件夹条目（2026-11-28 网盘刮削归档补移动批：五家逐家按
+  /// 各自已在用的鉴权/域名体系补上，接口出处见各家实现注释）。
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  );
+
+  /// 把 [file] 移进 [targetFolderId] 文件夹（只移动，不改名、
+  /// 不删除）。[targetFolderPath] 仅百度用：它的文件管理按
+  /// 完整路径寻址，目标文件夹的路径由调用方（引擎）从建夹/
+  /// 列表返回的 extra['path'] 传入；其余四家忽略此参数。
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  });
+
   /// 凭证被刷新时的回调（阿里 access_token 续期用，引擎负责落盘）。
   void Function(String providerId, CloudCredentials credentials)?
   get onCredentialsRefreshed;
@@ -992,6 +1014,85 @@ class Pan115Provider implements CloudDriveProvider {
       for (final item in data)
         if (item is Map<String, dynamic>) _parseItem(item),
     ];
+  }
+
+  static const _addFolderUrl = 'https://webapi.115.com/files/add';
+  static const _moveFileUrl = 'https://webapi.115.com/files/move';
+
+  /// 建夹：POST webapi.115.com/files/add，表单 pid（父目录
+  /// cid）+ cname（文件夹名），回包顶层带新文件夹的 cid
+  /// （115 网页端与公开实现 p115client 的同一接口）。
+  @override
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  ) async {
+    final generation = _sessionGeneration;
+    final cookieUsed = credentials.fields['cookie'] ?? '';
+    final response = await _postForm(
+      client,
+      Uri.parse(_addFolderUrl),
+      {'pid': parentId, 'cname': name},
+      headers: _authHeaders(credentials),
+    );
+    _throwIfRateLimited(response, '115 创建文件夹失败');
+    if (response.statusCode != 200) {
+      throw CloudDriveException('115 创建文件夹失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '115 创建文件夹');
+    _checkState(
+      root,
+      cookieUsed: cookieUsed,
+      generation: generation,
+      what: '115 创建文件夹失败',
+    );
+    var cid = _asString(root['cid']);
+    if (cid.isEmpty && root['data'] is Map<String, dynamic>) {
+      cid = _asString((root['data'] as Map<String, dynamic>)['cid']);
+    }
+    if (cid.isEmpty) {
+      throw CloudDriveException('115 创建文件夹失败：没有返回新文件夹 id');
+    }
+    return CloudDriveFile(
+      id: cid,
+      name: name,
+      isFolder: true,
+      kind: CloudFileKind.folder,
+    );
+  }
+
+  /// 移动：POST webapi.115.com/files/move，表单 pid（目标
+  /// 文件夹 cid）+ fid（文件 id）+ move_proid（空串，网页端
+  /// 同口径）。只移动本文件一个，不批量、不改名。
+  @override
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  }) async {
+    final generation = _sessionGeneration;
+    final cookieUsed = credentials.fields['cookie'] ?? '';
+    final response = await _postForm(
+      client,
+      Uri.parse(_moveFileUrl),
+      {'pid': targetFolderId, 'fid': file.id, 'move_proid': ''},
+      headers: _authHeaders(credentials),
+    );
+    _throwIfRateLimited(response, '115 移动文件失败');
+    if (response.statusCode != 200) {
+      throw CloudDriveException('115 移动文件失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '115 移动文件');
+    _checkState(
+      root,
+      cookieUsed: cookieUsed,
+      generation: generation,
+      what: '115 移动文件失败',
+    );
   }
 
   @override
@@ -1919,6 +2020,96 @@ class QuarkProvider implements CloudDriveProvider {
     throw UnsupportedError('夸克网盘没有站方搜索接口');
   }
 
+  static const _createFolderUrl =
+      'https://drive-pc.quark.cn/1/clouddrive/file';
+  static const _moveFileUrl =
+      'https://drive-pc.quark.cn/1/clouddrive/file/move';
+
+  /// 夸克回包统一信封：status=200 且 code=0 才算成功，失败
+  /// 把 message 如实带出。
+  void _checkOk(Map<String, dynamic> root, String what) {
+    final status = _asInt(root['status'], -1);
+    final code = _asInt(root['code'], -1);
+    if (status == 200 && code == 0) return;
+    final message = _asString(root['message'], '接口报错');
+    throw CloudDriveException('$what：$message');
+  }
+
+  /// 建夹：POST drive-pc.quark.cn/1/clouddrive/file，JSON
+  /// {pdir_fid, file_name, dir_path:'', dir_init_lock:false}，
+  /// 同步回包 data.fid 即新文件夹 id（夸克 PC 端同一接口）。
+  @override
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  ) async {
+    final uri = Uri.parse(_createFolderUrl).replace(
+      queryParameters: {'pr': 'ucpro', 'fr': 'pc'},
+    );
+    final response = await _postJson(
+      client,
+      uri,
+      {
+        'pdir_fid': parentId,
+        'file_name': name,
+        'dir_path': '',
+        'dir_init_lock': false,
+      },
+      headers: _authHeaders(credentials),
+    );
+    if (response.statusCode != 200) {
+      throw CloudDriveException('夸克创建文件夹失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '夸克创建文件夹');
+    _checkOk(root, '夸克创建文件夹失败');
+    final data = root['data'];
+    final fid = data is Map<String, dynamic> ? _asString(data['fid']) : '';
+    if (fid.isEmpty) {
+      throw CloudDriveException('夸克创建文件夹失败：没有返回新文件夹 id');
+    }
+    return CloudDriveFile(
+      id: fid,
+      name: name,
+      isFolder: true,
+      kind: CloudFileKind.folder,
+    );
+  }
+
+  /// 移动：POST /1/clouddrive/file/move，JSON {action_type:1,
+  /// filelist:[fid], to_pdir_fid, exclude_fids:[]}。回包带
+  /// task_id 时是异步任务（服务端已受理），本层按已受理算
+  /// 成功、如实记在报告里（真机终态待验）。
+  @override
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  }) async {
+    final uri = Uri.parse(_moveFileUrl).replace(
+      queryParameters: {'pr': 'ucpro', 'fr': 'pc'},
+    );
+    final response = await _postJson(
+      client,
+      uri,
+      {
+        'action_type': 1,
+        'filelist': [file.id],
+        'to_pdir_fid': targetFolderId,
+        'exclude_fids': <String>[],
+      },
+      headers: _authHeaders(credentials),
+    );
+    if (response.statusCode != 200) {
+      throw CloudDriveException('夸克移动文件失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '夸克移动文件');
+    _checkOk(root, '夸克移动文件失败');
+  }
+
   @override
   Future<CloudDirectLink> directLink(
     http.Client client,
@@ -2325,6 +2516,105 @@ class BaiduProvider implements CloudDriveProvider {
     ];
   }
 
+  /// 建夹：百度的文件夹按完整路径寻址——[parentId] 本身就
+  /// 是父文件夹路径（根为 '/'）。POST xpan/file?method=
+  /// create，表单 path（新文件夹完整路径）+ isdir=1 +
+  /// size=0 + rtype=0（重名即失败；引擎先查列表确认不存在
+  /// 才调这里）。回包 fs_id 与 path 一并带回（path 存
+  /// extra，移动时要用）。
+  @override
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  ) async {
+    final parentPath = parentId.isEmpty ? '/' : parentId;
+    final path = parentPath.endsWith('/')
+        ? '$parentPath$name'
+        : '$parentPath/$name';
+    final uri = Uri.parse(_xpanUrl).replace(
+      queryParameters: {'method': 'create'},
+    );
+    final response = await _postForm(
+      client,
+      uri,
+      {'path': path, 'size': '0', 'isdir': '1', 'rtype': '0'},
+      headers: _authHeaders(credentials),
+    );
+    if (response.statusCode != 200) {
+      throw CloudDriveException('百度创建文件夹失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '百度创建文件夹');
+    if (_asInt(root['errno'], -1) != 0) {
+      throw CloudDriveException(
+        '百度创建文件夹失败：${_asString(root['errmsg'], '接口报错（errno ${_asInt(root['errno'], -1)}）')}',
+      );
+    }
+    return CloudDriveFile(
+      id: _asString(root['fs_id']),
+      name: name,
+      isFolder: true,
+      kind: CloudFileKind.folder,
+      extra: {'path': _asString(root['path'], path)},
+    );
+  }
+
+  /// 移动：POST xpan/file?method=filemanager&opera=move，
+  /// 表单 filelist 是 JSON 串 [{path, dest, newname,
+  /// ondup:'fail'}]（百度开放平台文件管理同一形态，本树
+  /// 走 Cookie 会话与列表同体系）。源路径取 file.extra
+  /// ['path']（列表解析时带回），目标路径由引擎经
+  /// [targetFolderPath] 传入；newname 保持原文件名（只移
+  /// 不改名），ondup=fail 表示目标已有同名时如实失败、
+  /// 不覆盖不改名。
+  @override
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  }) async {
+    final sourcePath = file.extra['path'] ?? '';
+    if (sourcePath.isEmpty) {
+      throw CloudDriveException('百度移动文件失败：缺少文件路径，请刷新列表后重试');
+    }
+    final dest = targetFolderPath ?? '';
+    if (dest.isEmpty) {
+      throw CloudDriveException('百度移动文件失败：缺少目标文件夹路径');
+    }
+    final fileName = sourcePath.split('/').last;
+    final uri = Uri.parse(_xpanUrl).replace(
+      queryParameters: {'method': 'filemanager', 'opera': 'move'},
+    );
+    final response = await _postForm(
+      client,
+      uri,
+      {
+        'async': '0',
+        'filelist': jsonEncode([
+          {
+            'path': sourcePath,
+            'dest': dest,
+            'newname': fileName,
+            'ondup': 'fail',
+          },
+        ]),
+      },
+      headers: _authHeaders(credentials),
+    );
+    if (response.statusCode != 200) {
+      throw CloudDriveException('百度移动文件失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '百度移动文件');
+    if (_asInt(root['errno'], -1) != 0) {
+      throw CloudDriveException(
+        '百度移动文件失败：${_asString(root['errmsg'], '接口报错（errno ${_asInt(root['errno'], -1)}）')}',
+      );
+    }
+  }
+
   @override
   Future<CloudDirectLink> directLink(
     http.Client client,
@@ -2378,6 +2668,10 @@ class AliyunProvider implements CloudDriveProvider {
       'https://open.aliyundrive.com/adrive/v1.0/openFile/list';
   static const _downloadUrl =
       'https://open.aliyundrive.com/adrive/v1.0/openFile/getDownloadUrl';
+  static const _createUrl =
+      'https://open.aliyundrive.com/adrive/v1.0/openFile/create';
+  static const _moveUrl =
+      'https://open.aliyundrive.com/adrive/v1.0/openFile/move';
   static const _ua =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36';
@@ -2662,6 +2956,84 @@ class AliyunProvider implements CloudDriveProvider {
   ) async {
     // 阿里 OpenAPI 没有搜索接口，走引擎的“取列表后按名过滤”兜底。
     throw UnsupportedError('阿里云盘没有站方搜索接口');
+  }
+
+  /// 建夹：阿里 OpenAPI POST /adrive/v1.0/openFile/create，
+  /// {drive_id, parent_file_id, name, type:'folder',
+  /// check_name_mode:'refuse'}（重名拒绝——引擎先查列表，
+  /// 存在就不调这里）；成功回 201 带 file_id。
+  @override
+  Future<CloudDriveFile> createFolder(
+    http.Client client,
+    CloudCredentials credentials,
+    String parentId,
+    String name,
+  ) async {
+    final driveId = credentials.fields['drive_id'] ?? '';
+    final response = await _withAuth(
+      client,
+      credentials,
+      (token) => _postJson(
+        client,
+        Uri.parse(_createUrl),
+        {
+          'drive_id': driveId,
+          'parent_file_id': parentId,
+          'name': name,
+          'type': 'folder',
+          'check_name_mode': 'refuse',
+        },
+        headers: {'Authorization': 'Bearer $token', 'User-Agent': _ua},
+      ),
+    );
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      throw CloudDriveException('阿里创建文件夹失败（HTTP ${response.statusCode}）');
+    }
+    final root = _jsonObject(response.body, '阿里创建文件夹');
+    final fileId = _asString(root['file_id']);
+    if (fileId.isEmpty) {
+      throw CloudDriveException('阿里创建文件夹失败：没有返回新文件夹 id');
+    }
+    return CloudDriveFile(
+      id: fileId,
+      name: name,
+      isFolder: true,
+      kind: CloudFileKind.folder,
+    );
+  }
+
+  /// 移动：POST /adrive/v1.0/openFile/move，{drive_id,
+  /// file_id, to_parent_file_id}。回包可能带 async_task_id
+  /// （服务端异步执行），本层按已受理算成功、如实记报告
+  /// （真机终态待验）；同步完成时回 file_id。
+  @override
+  Future<void> moveFile(
+    http.Client client,
+    CloudCredentials credentials,
+    CloudDriveFile file,
+    String targetFolderId, {
+    String? targetFolderPath,
+  }) async {
+    final driveId = credentials.fields['drive_id'] ?? '';
+    final response = await _withAuth(
+      client,
+      credentials,
+      (token) => _postJson(
+        client,
+        Uri.parse(_moveUrl),
+        {
+          'drive_id': driveId,
+          'file_id': file.id,
+          'to_parent_file_id': targetFolderId,
+        },
+        headers: {'Authorization': 'Bearer $token', 'User-Agent': _ua},
+      ),
+    );
+    if (response.statusCode != 200 &&
+        response.statusCode != 201 &&
+        response.statusCode != 204) {
+      throw CloudDriveException('阿里移动文件失败（HTTP ${response.statusCode}）');
+    }
   }
 
   @override

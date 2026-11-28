@@ -9,6 +9,7 @@ import '../services/backend_service.dart';
 import '../services/lan_share_preferences.dart';
 import '../services/local_media_proxy.dart';
 import '../services/local_proxy_preferences.dart';
+import '../services/net_resilience.dart';
 import '../widgets/home/home_design.dart';
 import '../widgets/series_detail/moyi_detail_theme.dart';
 import '../widgets/settings/settings_widgets.dart';
@@ -50,6 +51,10 @@ class _ApiServicePageState extends State<ApiServicePage> {
   String? _proxyProbeResult;
   bool _proxyProbeOk = false;
 
+  /// 网络容灾两开关（GitHub 镜像回退 / DNS over HTTPS），都默认开。
+  bool _mirrorEnabled = true;
+  bool _dohEnabled = true;
+
   /// Device-pool size reported by `/health`; null until the first answer.
   int? _devices;
 
@@ -67,6 +72,29 @@ class _ApiServicePageState extends State<ApiServicePage> {
     _loadShareState();
     _refresh();
     _loadProxyState();
+    _loadNetResilienceState();
+  }
+
+  Future<void> _loadNetResilienceState() async {
+    await NetResiliencePreferences.instance.load();
+    if (!mounted) return;
+    setState(() {
+      _mirrorEnabled =
+          NetResiliencePreferences.instance.githubMirrorEnabled.value;
+      _dohEnabled = NetResiliencePreferences.instance.dohEnabled.value;
+    });
+  }
+
+  Future<void> _toggleGithubMirror(bool value) async {
+    await NetResiliencePreferences.instance.setGithubMirrorEnabled(value);
+    if (!mounted) return;
+    setState(() => _mirrorEnabled = value);
+  }
+
+  Future<void> _toggleDoh(bool value) async {
+    await NetResiliencePreferences.instance.setDohEnabled(value);
+    if (!mounted) return;
+    setState(() => _dohEnabled = value);
   }
 
   Future<void> _loadProxyState() async {
@@ -608,6 +636,57 @@ class _ApiServicePageState extends State<ApiServicePage> {
             ),
           ),
 
+          const SizedBox(height: 8),
+          // 网络容灾：GitHub 镜像回退 + DNS over HTTPS，两开关默认开。
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(LucideIcons.shield, size: 16, color: moyiMutedOnDark),
+                    const SizedBox(width: 8),
+                    Text(
+                      '网络容灾',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                _netSwitchRow(
+                  theme: theme,
+                  icon: LucideIcons.git_branch,
+                  label: 'GitHub 镜像回退',
+                  value: _mirrorEnabled,
+                  onChanged: _toggleGithubMirror,
+                ),
+                Text(
+                  '插件索引、插件包、订阅文件这些放在 GitHub 上的文件拉不到时，自动改走 jsDelivr 镜像重拉。默认开。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: moyiMutedOnDark,
+                  ),
+                ),
+                Divider(height: 20, color: moyiDarkCardBorder),
+                _netSwitchRow(
+                  theme: theme,
+                  icon: LucideIcons.lock,
+                  label: '加密 DNS（DoH）',
+                  value: _dohEnabled,
+                  onChanged: _toggleDoh,
+                ),
+                Text(
+                  '域名解析失败或被污染时，改走 Cloudflare / Google 的加密 DNS 解析再连接，证书仍按原域名校验。默认开。番茄核心、播放器取流与网页内核的解析不在此列。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: moyiMutedOnDark,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
           // 接口是参考信息，默认收起；要用的人自己点开。
           const SizedBox(height: 8),
           TextButton.icon(
@@ -733,6 +812,39 @@ class _ApiServicePageState extends State<ApiServicePage> {
               ),
             ),
             Icon(LucideIcons.copy, size: 15, color: moyiMutedOnDark),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 网络容灾卡里的一行开关：图标 + 名称 + 开关，整行可点。
+  Widget _netSwitchRow({
+    required ThemeData theme,
+    required IconData icon,
+    required String label,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return InkWell(
+      onTap: () => onChanged(!value),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Icon(icon, size: 16, color: moyiMutedOnDark),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: theme.textTheme.bodyMedium?.copyWith(color: Colors.white),
+            ),
+            const Spacer(),
+            SettingsSwitch(
+              value: value,
+              semanticLabel: label,
+              onChanged: onChanged,
+            ),
           ],
         ),
       ),

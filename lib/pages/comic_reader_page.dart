@@ -51,6 +51,7 @@ class ComicReaderPage extends StatefulWidget {
   final ReaderStore? readerStore;
   final ComicChapterLoader? chapterLoader;
   final ComicImageProviderFactory? imageProviderFactory;
+  final ApiClient? apiClient;
 
   /// 目录缓存，供「最近阅读/书架」下次直接续读漫画用。
   ///
@@ -72,6 +73,7 @@ class ComicReaderPage extends StatefulWidget {
     this.readerStore,
     this.chapterLoader,
     this.imageProviderFactory,
+    this.apiClient,
     this.cache,
     this.shelfItem,
   });
@@ -134,6 +136,7 @@ class _ComicReaderPageState extends State<ComicReaderPage>
   String? _error;
 
   Chapter get _chapter => widget.chapters[_chapterIndex];
+  ApiClient get _api => widget.apiClient ?? ApiClient.instance;
 
   /// part 里的扩展不是 [State] 子类，不能直接调受保护的 `setState`，
   /// 统一转一层（与 reader_page 的 `_setState` 相同）。

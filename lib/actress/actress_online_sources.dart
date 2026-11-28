@@ -150,6 +150,12 @@ class PhActressSource extends ActressOnlineSource {
       page: page,
     );
     final html = await fetch(url, pageHeaders);
+    // PH 搜索查无此物回 404 模板页（正文全是推荐位）：判
+    // 「未找到」回空表，不把推荐位冒充搜索结果。只在搜索
+    // （query 非空）时判、只在 PH 源内判；浏览照旧解析。
+    if (query.trim().isNotEmpty && phIsNotFoundPage(html)) {
+      return const [];
+    }
     return parsePhCards(html);
   }
 

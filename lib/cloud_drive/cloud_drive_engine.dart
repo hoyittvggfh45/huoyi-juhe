@@ -278,6 +278,91 @@ class CloudDriveEngine {
     return provider.directLink(_httpClient, credentials, file);
   }
 
+  // -------------------------------------------------------------------------
+  // 刮削归档：建分类文件夹 + 移动文件（2026-11-28 补移动批）
+  // -------------------------------------------------------------------------
+
+  /// 确保网盘根目录下名为 [folderName] 的文件夹存在，返回
+  /// 它的条目：先翻根目录列表按名找（找到直接用、绝不重
+  /// 建），找不到才调 provider 建夹。建夹后清目录缓存（根
+  /// 列表已变）。只在根目录一层建，不递归建多级。
+  Future<CloudDriveFile> ensureRootFolder(
+    String providerId,
+    String folderName,
+  ) async {
+    final provider = _provider(providerId);
+    if (provider == null) throw AppFailure('未知的网盘：$providerId');
+    final credentials = _credentials(providerId);
+    try {
+      for (var page = 1; page <= 10; page++) {
+        final result = await provider.listFolder(
+          _httpClient,
+          credentials,
+          provider.rootFolderId,
+          page,
+        );
+        for (final file in result.files) {
+          if (file.isFolder && file.name == folderName) return file;
+        }
+        if (!result.hasMore) break;
+      }
+      final created = await provider.createFolder(
+        _httpClient,
+        credentials,
+        provider.rootFolderId,
+        folderName,
+      );
+      _clearCatalogCaches();
+      return created;
+    } on CloudDriveException catch (e) {
+      throw AppFailure(e.message);
+    }
+  }
+
+  /// 归档移动一步到位：根下确保分类文件夹 → 把条目移入。
+  /// [fileId] 是网盘侧文件 id（不是卡片 id）；文件本体优先
+  /// 从条目缓存取（百度移动要靠它带回的 extra['path']），
+  /// 缓存没有时用只有 id 的最小条目——百度会因此如实报
+  /// 「缺少文件路径」，其余四家照常可移。移完清目录缓存
+  /// （源文件夹列表已变）。失败回 (false, 原因)，不抛错，
+  /// 调用方（归档器）逐条记账、不连坐。
+  Future<({bool moved, String reason})> archiveMoveToCategoryFolder({
+    required String providerId,
+    required String fileId,
+    required String folderName,
+  }) async {
+    final provider = _provider(providerId);
+    if (provider == null) return (moved: false, reason: '未知的网盘：$providerId');
+    try {
+      final folder = await ensureRootFolder(providerId, folderName);
+      final credentials = _credentials(providerId);
+      final cached = _cache[dramaId(providerId, fileId)]?.file;
+      final file =
+          cached ??
+          CloudDriveFile(
+            id: fileId,
+            name: '',
+            isFolder: false,
+            kind: CloudFileKind.other,
+          );
+      await provider.moveFile(
+        _httpClient,
+        credentials,
+        file,
+        folder.id,
+        targetFolderPath: folder.extra['path'],
+      );
+      _clearCatalogCaches();
+      return (moved: true, reason: '已移入「$folderName」');
+    } on AppFailure catch (e) {
+      return (moved: false, reason: e.message);
+    } on CloudDriveException catch (e) {
+      return (moved: false, reason: e.message);
+    } catch (e) {
+      return (moved: false, reason: '移动失败：$e');
+    }
+  }
+
   void _remember(String key, CloudDriveFile file, CloudCoverSource coverSource) {
     if (_cache.length >= _cacheCap) {
       _cache.remove(_cache.keys.first);

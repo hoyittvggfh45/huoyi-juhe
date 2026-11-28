@@ -137,7 +137,7 @@ void main() {
       final executor = _OldSqliteExecutor();
       final livePath = '${tempDir.path}/女优库.db';
       await File(livePath).writeAsString('OLDDB');
-      final importer = ActressSqlImporter(versionGate: (_) async => null,
+      final importer = ActressSqlImporter(
         batchSize: 100,
         executorFactory: factoryFor(executor),
       );

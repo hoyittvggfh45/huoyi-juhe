@@ -340,6 +340,104 @@ class JavdbMagnet {
   final bool cnsub;
 }
 
+/// 一条评论（api/v1/movies/{id}/reviews）：只带接口真返回
+/// 的字段，缺失给安全默认值；正文可含磁力分享，抽链见
+/// [javdbMagnetLinksIn]。
+class JavdbReview {
+  const JavdbReview({
+    required this.id,
+    required this.username,
+    this.score = 0,
+    this.content = '',
+    this.likesCount = 0,
+    this.createdAt = '',
+    this.statusTitle = '',
+  });
+
+  final int id;
+  final String username;
+
+  /// 评分（0–5，0 表示未评分）。
+  final double score;
+  final String content;
+  final int likesCount;
+  final String createdAt;
+
+  /// 观看状态文案（如「看過」），接口没给就是空。
+  final String statusTitle;
+
+  factory JavdbReview.fromJson(Map<String, dynamic> json) {
+    return JavdbReview(
+      id: _javdbInt(json['id']),
+      username: _javdbStr(json['username']),
+      score: _javdbDouble(json['score']),
+      content: _javdbStr(json['content']),
+      likesCount: _javdbInt(json['likes_count']),
+      createdAt: _javdbStr(json['created_at']),
+      statusTitle: _javdbStr(json['status_title']),
+    );
+  }
+}
+
+/// 一个相关清单（api/v1/lists/related）：只有元数据，本批
+/// 不取清单内作品列表；缺失给安全默认值，description 为
+/// null 时转空串。
+class JavdbRelatedList {
+  const JavdbRelatedList({
+    required this.id,
+    required this.name,
+    this.description = '',
+    this.moviesCount = 0,
+    this.viewsCount = 0,
+    this.collectionsCount = 0,
+    this.shareInfo = '',
+    this.createdAt = '',
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final int moviesCount;
+  final int viewsCount;
+  final int collectionsCount;
+  final String shareInfo;
+  final String createdAt;
+
+  factory JavdbRelatedList.fromJson(Map<String, dynamic> json) {
+    final share = json['share_info'];
+    return JavdbRelatedList(
+      id: _javdbStr(json['id']),
+      name: _javdbStr(json['name']),
+      description: _javdbStr(json['description']),
+      moviesCount: _javdbInt(json['movies_count']),
+      viewsCount: _javdbInt(json['views_count']),
+      collectionsCount: _javdbInt(json['collections_count']),
+      shareInfo: share is String ? share.trim() : '',
+      createdAt: _javdbStr(json['created_at']),
+    );
+  }
+}
+
+/// 从正文里抽全部磁力链接：以 `magnet:?xt=urn:btih:` 开头、
+/// 抽到空白为止，并剥尾部标点；无则空表。
+List<String> javdbMagnetLinksIn(String text) {
+  if (text.isEmpty) return const [];
+  final matches = RegExp(
+    r'magnet:\?xt=urn:btih:[^\s]+',
+    caseSensitive: false,
+  ).allMatches(text);
+  const trailing = '.,;:!?)]}>\'"，。；：！？）】》、…';
+  final links = <String>[];
+  for (final match in matches) {
+    var link = match.group(0)!;
+    while (link.isNotEmpty && trailing.contains(link[link.length - 1])) {
+      link = link.substring(0, link.length - 1);
+    }
+    if (link.isNotEmpty) links.add(link);
+  }
+  return links;
+}
+
 /// hash 归一（照 jar 版 normHash）：磁力链接里抽 btih，只认
 /// 40 位十六进制、转小写；认不出回空（这类条目排序时丢弃）。
 String javdbNormHashOf(String raw) {
@@ -529,6 +627,11 @@ String _javdbStr(Object? value) {
 int _javdbInt(Object? value, {int fallback = 0}) {
   if (value is num) return value.toInt();
   return int.tryParse(value?.toString() ?? '') ?? fallback;
+}
+
+double _javdbDouble(Object? value, {double fallback = 0}) {
+  if (value is num) return value.toDouble();
+  return double.tryParse(value?.toString() ?? '') ?? fallback;
 }
 
 bool _javdbBool(Object? value) {
@@ -886,6 +989,43 @@ class JavdbApiClient {
       for (final item in javdbRankMagnetJsons(raw))
         ?javdbMagnetLinkOf(item),
     ];
+  }
+
+  /// 评论列表（GET api/v1/movies/{id}/reviews?page={n}，
+  /// 信封 data.reviews；每页 10 条、默认热门序）。失败/无
+  /// 数据一律回空表，不抛错、不带英文原文。
+  Future<List<JavdbReview>> movieReviews(
+    String movieId, {
+    int page = 1,
+  }) async {
+    try {
+      final data = await _getJson(
+        'api/v1/movies/$movieId/reviews?page=$page',
+      );
+      final list = _listOf(data, const ['reviews', 'list', 'items']);
+      return [
+        for (final item in list)
+          if (item is Map<String, dynamic>) JavdbReview.fromJson(item),
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 相关清单（GET api/v1/lists/related?movie_id={id}，信
+  /// 封 data.lists）：只有元数据、无作品列表。失败/无数据
+  /// 一律回空表，不抛错、不带英文原文。
+  Future<List<JavdbRelatedList>> movieRelatedLists(String movieId) async {
+    try {
+      final data = await _getJson('api/v1/lists/related?movie_id=$movieId');
+      final list = _listOf(data, const ['lists']);
+      return [
+        for (final item in list)
+          if (item is Map<String, dynamic>) JavdbRelatedList.fromJson(item),
+      ];
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// data 可能是列表本体，或 {movies:[...]} 等信封——都认，

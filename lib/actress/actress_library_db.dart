@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:sqflite/sqflite.dart';
 
+import '../services/import_debug_log.dart';
 import 'actress_database.dart' show applyActressDbReadPragmas;
 import 'actress_db_source.dart';
 import 'actress_magnet_library.dart' show ActressMagnetAutoRegistration;
@@ -174,7 +175,7 @@ class ActressLibraryDbFallback {
       if (query == null) {
         return {
           'ok': false,
-          'error': '演员库还没激活：请到数据库管理页导入女优库完成激活（需带版本字段）',
+          'error': '演员库还没激活：请到数据库管理页导入女优库完成激活',
         };
       }
       final tables = await _tableSet(query);
@@ -208,9 +209,18 @@ class ActressLibraryDbFallback {
         default:
           return {'ok': false, 'error': '未知 op：$op'};
       }
-    } catch (error) {
+    } catch (error, stack) {
       _reset();
-      // 异常原文不上屏（2026-11-27 错误文案中文化令）：只回中文。
+      // 不可用留证（2026-11-28 取消激活批 C4）：异常原文不
+      // 上屏（2026-11-27 错误文案中文化令，只回中文），但
+      // 必须落定点日志——旧实现把开库/查询异常全吞成一句
+      // 「不可用」，真机故障无从定点（诊断 §3）。写日志永
+      // 不抛错、不挡本次回话。
+      await ImportDebugLog.record(
+        stage: '读库层 ActressLibraryDbFallback.handle',
+        error: error,
+        stack: stack,
+      );
       return {'ok': false, 'error': '本地女优库不可用，请重新加载数据库'};
     }
   }

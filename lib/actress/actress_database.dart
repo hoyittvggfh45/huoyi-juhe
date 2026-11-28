@@ -438,6 +438,27 @@ ActressWork videoLibraryWorkFromRow(
   );
 }
 
+/// 查询撞上句柄已被关闭的错误（真机字面
+/// `DatabaseException(database_closed 10)`）：导入收尾关库、
+/// 换库换连接与页面查询并发时，在途查询提交会撞这个错。
+bool isActressDbClosedError(Object error) {
+  final text = error.toString().toLowerCase();
+  return text.contains('database_closed') || text.contains('database closed');
+}
+
+/// 关后自愈重试（2026-11-28 database_closed 自查批）：整段查询
+/// 撞 database_closed 时原样重跑一次——重跑时 _open() 自愈
+/// （关了重开、换了拿新句柄）；非关库错误不重试，第二次仍撞
+/// 关也原样抛，不无限重试。
+Future<T> retryOnceOnClosedDb<T>(Future<T> Function() body) async {
+  try {
+    return await body();
+  } catch (e) {
+    if (!isActressDbClosedError(e)) rethrow;
+    return await body();
+  }
+}
+
 /// sqflite 实现：独立 actress.db，不动 app.db 的版本与表结构。
 class SqfliteActressDatabase implements ActressDatabase {
   SqfliteActressDatabase._({this.pathOverride});
@@ -551,9 +572,13 @@ class SqfliteActressDatabase implements ActressDatabase {
     final isVideoDb =
         !isActressDb && await _looksLikeVideoLibraryDb(filePath);
     _videoLibraryMode = isVideoDb;
+    // 2026-11-28 database_closed 自查：必须独立连接——默认单例
+    // 按路径返回缓存实例，与探库/本类其它实例共用同一句柄时，
+    // 任一方 close 都会把页面正在用的活连接关掉。
     final db = await openDatabase(
       filePath,
       readOnly: true,
+      singleInstance: false,
       onOpen: applyActressDbReadPragmas,
     );
     // 强制读一次文件头：损坏文件 open 时不一定报错，第一次查询
@@ -873,7 +898,14 @@ class SqfliteActressDatabase implements ActressDatabase {
   Future<bool> _looksLikeActressDb(String filePath) async {
     Database? probe;
     try {
-      probe = await openDatabase(filePath, readOnly: true);
+      // 2026-11-28 database_closed 自查：探库必须独立连接——
+      // 默认单例下同路径 open 拿到的就是主库活连接，finally 里
+      // close() 会把页面正在用的共享句柄关掉（换库探库时必现）。
+      probe = await openDatabase(
+        filePath,
+        readOnly: true,
+        singleInstance: false,
+      );
       return await _isActressSchemaDb(probe);
     } catch (_) {
       return false;
@@ -906,7 +938,12 @@ class SqfliteActressDatabase implements ActressDatabase {
   Future<bool> _looksLikeVideoLibraryDb(String filePath) async {
     Database? probe;
     try {
-      probe = await openDatabase(filePath, readOnly: true);
+      // 同 _looksLikeActressDb：探库独立连接，关自己的。
+      probe = await openDatabase(
+        filePath,
+        readOnly: true,
+        singleInstance: false,
+      );
       return await _isVideoLibraryDb(probe);
     } catch (_) {
       return false;
@@ -1100,7 +1137,10 @@ class SqfliteActressDatabase implements ActressDatabase {
   }
 
   @override
-  Future<ActressPerson?> personById(int localId) async {
+  Future<ActressPerson?> personById(int localId) =>
+      retryOnceOnClosedDb(() => _personByIdImpl(localId));
+
+  Future<ActressPerson?> _personByIdImpl(int localId) async {
     final db = await _open();
     if (_videoLibraryMode) {
       // 没有 actresses 表的外来库：人物 id 是 video_actress 的
@@ -1210,6 +1250,28 @@ class SqfliteActressDatabase implements ActressDatabase {
 
   @override
   Future<List<ActressPerson>> listPersons({
+    required ActressSexFilter sex,
+    required ActressSort sort,
+    required String query,
+    required int offset,
+    required int limit,
+    String tag = '',
+    String category = '',
+    String videoTag = '',
+  }) => retryOnceOnClosedDb(
+    () => _listPersonsImpl(
+      sex: sex,
+      sort: sort,
+      query: query,
+      offset: offset,
+      limit: limit,
+      tag: tag,
+      category: category,
+      videoTag: videoTag,
+    ),
+  );
+
+  Future<List<ActressPerson>> _listPersonsImpl({
     required ActressSexFilter sex,
     required ActressSort sort,
     required String query,
@@ -1446,6 +1508,20 @@ class SqfliteActressDatabase implements ActressDatabase {
     required String query,
     String tag = '',
     String videoTag = '',
+  }) => retryOnceOnClosedDb(
+    () => _countPersonsImpl(
+      sex: sex,
+      query: query,
+      tag: tag,
+      videoTag: videoTag,
+    ),
+  );
+
+  Future<int> _countPersonsImpl({
+    required ActressSexFilter sex,
+    required String query,
+    String tag = '',
+    String videoTag = '',
   }) async {
     final db = await _open();
     if (_videoLibraryMode) {
@@ -1561,6 +1637,10 @@ class SqfliteActressDatabase implements ActressDatabase {
   @override
   Future<List<ActressPerson>> allPersonsForRanking({
     required ActressSexFilter sex,
+  }) => retryOnceOnClosedDb(() => _allPersonsForRankingImpl(sex: sex));
+
+  Future<List<ActressPerson>> _allPersonsForRankingImpl({
+    required ActressSexFilter sex,
   }) async {
     final db = await _open();
     if (_videoLibraryMode) {
@@ -1648,7 +1728,19 @@ class SqfliteActressDatabase implements ActressDatabase {
   }
 
   @override
-  Future<int> countWorks(int personId, {String? category, String? videoTag}) async {
+  Future<int> countWorks(
+    int personId, {
+    String? category,
+    String? videoTag,
+  }) => retryOnceOnClosedDb(
+    () => _countWorksImpl(personId, category: category, videoTag: videoTag),
+  );
+
+  Future<int> _countWorksImpl(
+    int personId, {
+    String? category,
+    String? videoTag,
+  }) async {
     final db = await _open();
     if (_videoLibraryMode) {
       final useCategory = category != null && category.isNotEmpty;
@@ -1687,7 +1779,10 @@ class SqfliteActressDatabase implements ActressDatabase {
   }
 
   @override
-  Future<Set<String>> distinctWorkKeysForName(String name) async {
+  Future<Set<String>> distinctWorkKeysForName(String name) =>
+      retryOnceOnClosedDb(() => _distinctWorkKeysForNameImpl(name));
+
+  Future<Set<String>> _distinctWorkKeysForNameImpl(String name) async {
     final db = await _open();
     if (!_videoLibraryMode) return const {};
     final trimmed = name.trim();
@@ -1719,7 +1814,10 @@ class SqfliteActressDatabase implements ActressDatabase {
   /// 多库勾选时列表页分类行取各库并集。只读查询，不写盘；
   /// 没有 video_category 表的库直接抛错，调用方跳过。
   @override
-  Future<List<(String, int)>> dbCategories() async {
+  Future<List<(String, int)>> dbCategories() =>
+      retryOnceOnClosedDb(() => _dbCategoriesImpl());
+
+  Future<List<(String, int)>> _dbCategoriesImpl() async {
     final db = await _open();
     final rows = await db.rawQuery(
       'SELECT main_category, COUNT(*) AS c FROM video_category '
@@ -1736,7 +1834,10 @@ class SqfliteActressDatabase implements ActressDatabase {
   /// 标签筛选底部弹窗的数据来源。只读查询，不写盘；没有 video_tag
   /// 表的库直接抛错，调用方跳过（与 dbCategories 同一口径）。
   @override
-  Future<List<(String, int)>> dbTags() async {
+  Future<List<(String, int)>> dbTags() =>
+      retryOnceOnClosedDb(() => _dbTagsImpl());
+
+  Future<List<(String, int)>> _dbTagsImpl() async {
     final db = await _open();
     final rows = await db.rawQuery(
       'SELECT tag_name, COUNT(*) AS c FROM video_tag '
@@ -1751,6 +1852,10 @@ class SqfliteActressDatabase implements ActressDatabase {
 
   @override
   Future<List<({String name, int count})>> workCategories(
+    int personId,
+  ) => retryOnceOnClosedDb(() => _workCategoriesImpl(personId));
+
+  Future<List<({String name, int count})>> _workCategoriesImpl(
     int personId,
   ) async {
     final db = await _open();
@@ -1830,7 +1935,10 @@ class SqfliteActressDatabase implements ActressDatabase {
 
 
   @override
-  Future<ActressSyncOverview> overview() async {
+  Future<ActressSyncOverview> overview() =>
+      retryOnceOnClosedDb(() => _overviewImpl());
+
+  Future<ActressSyncOverview> _overviewImpl() async {
     final db = await _open();
     // 视频库没有同步，但头顶人数取 overview.personsWithWorks，
     // 必须回实数——否则头顶显示“0 位演员”，而列表本身正常出人。

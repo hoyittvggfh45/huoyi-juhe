@@ -7,15 +7,13 @@ import 'package:sqflite/sqflite.dart';
 import '../services/import_debug_log.dart';
 import '../services/site_library.dart';
 import '../services/sql_text_stream.dart';
-import '../services/source_registry.dart';
-import '../services/unified_import.dart';
 import 'actress_database.dart';
 import 'actress_db_import.dart';
 import 'actress_db_source.dart';
 import 'actress_magnet_library.dart';
+import 'import_job_service.dart';
 import 'actress_mytv_bind.dart';
 import 'actress_neon.dart';
-import 'actress_sql_import.dart';
 import 'unified_import_page.dart';
 
 /// 统一数据库管理页（2026-11-27 双库批，全树唯一一份）：两个
@@ -26,12 +24,16 @@ import 'unified_import_page.dart';
 /// 才出数据。页内：导入按钮（.db / .sql / .sql.gz，导入成功
 /// 即激活，流程见 [ActressDbImportService]）+ 两张库卡：
 /// - 外置库卡 = **导入来源**：MYTV/db/女优库.db 放着不生效，
-///   卡上能看状态、能授权，点「导入激活」才走校验＋版本门
+///   卡上能看状态、能授权，点「导入激活」才走结构校验
 ///   拷进导入库；外置库永不给删、本页不写它一字。
-/// - 导入库卡 = 已激活的库：显激活状态与库自报版本、作品数、
+/// - 导入库卡 = 已激活的库：显激活状态、作品数、
 ///   大小、修改时间；可删除（删完演员库回到未激活）。
-/// 没激活时页顶有引导文案；版本字段缺失/对不上的导入失败
-/// 原因在本页红字区原样呈现（服务层给的中文原因）。
+/// 没激活时页顶有引导文案；导入失败原因在本页红字区原样
+/// 呈现（服务层给的中文原因）。
+///
+/// 站点已随包内置直显（2026-11-28 取消激活令）：本页不再有
+/// 站点卡，导入数据库只管演员库＋磁力，与站点脱钩；用户单独
+/// 拿一份站点文件来导，只给「站点已经内置」的中文提示。
 ///
 /// 红线：本页不写外置库；导入失败不毁任何现有可用库（服务层
 /// 保证）；读库层靠路径+文件戳机制失效旧连接（见
@@ -42,6 +44,7 @@ class ActressDbManagePage extends StatefulWidget {
     this.source,
     this.importService,
     this.siteLibraryService,
+    this.importJobService,
     this.onLibraryChanged,
     this.magnetLibrariesLoader,
   });
@@ -60,6 +63,10 @@ class ActressDbManagePage extends StatefulWidget {
   /// 站点库服务（测试注入假件；默认单例）。与女优库完全独立：
   /// 本页只是共用一个入口，校验器、落点、删除动作都不相干。
   final SiteLibraryService? siteLibraryService;
+
+  /// 导入任务服务（测试/预览注入假件；默认进程级单例——任务
+  /// 与页面解绑，离开页面照常跑）。
+  final ImportJobService? importJobService;
 
   /// 库发生变化（导入成功/切换/删除）后调：默认关主库连接并
   /// 强制重读一次，让演员库各读库入口立刻换到新库。测试可注入
@@ -82,54 +89,62 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
   ActressDbSourceStatus? _status;
   final _works = <ActressDbSlot, int?>{};
   var _loading = true;
-  var _importing = false;
-  var _cancelled = false;
-  ActressSqlImportProgress? _progress;
-  String? _message;
-  String? _error;
+
+  // 本页自有动作（外置导入激活/删除/授权）的结果行；统一口
+  // 的结果行由导入服务持有（见 _message/_error 合并读法）。
+  String? _localMessage;
+  String? _localError;
+  String? _localUnifiedError;
+  var _externalImporting = false;
 
   /// 已并存导入的磁力分类库登记（在导入库里）：只供状态行
   /// 跟随数据库带出计数（见 _magnetMergedStatus），不再有
   /// 独立区块与逐库删除（2026-11-28 令：磁力绑定数据库）。
   var _magnetLibraries = const <MagnetLibraryRecord>[];
-  var _magnetImporting = false;
-  ActressSqlImportProgress? _magnetProgress;
 
-  // 统一导入口状态（2026-11-28 统一导入口批）：认库中标记与
-  // 统一口自己的汇总结果行；各库的进度/结果状态仍各自保留。
-  var _unifiedSniffing = false;
-  String? _unifiedMessage;
-  String? _unifiedError;
+  // ── 后台导入（2026-11-28 批）：任务本体在 [ImportJobService]
+  // 单例里，页面只是订阅者＋发起者。dispose 只退订，绝不取消
+  // 任务；进度/结果都从服务状态读，回到页面即见实时状态。
+  ImportJobService get _jobService =>
+      widget.importJobService ?? ImportJobService.instance;
+  ImportJobState get _job => _jobService.state.value;
+  ImportJobPhase _lastJobPhase = ImportJobPhase.idle;
 
-  /// 合并文件（整份数据库）导入的整库口径结果：统一口汇总
-  /// 用它，不再写站点区的独立状态行（2026-11-28 设计令：
-  /// 站点绑定数据库激活，没有独立的站点库状态）。
-  bool? _bundleResultOk;
-  String? _bundleResultText;
+  String? get _message => _localMessage ?? _job.detailMessage;
+  String? get _error => _localError ?? _job.detailError;
+  String? get _unifiedMessage => _job.message;
+  String? get _unifiedError => _localUnifiedError ?? _job.error;
 
-  bool get _anyImporting =>
-      _importing || _magnetImporting || _siteImporting || _unifiedSniffing;
-
-  // 站点库区独立状态（与女优库导入互不干扰，可各自跑）。
-  var _siteImporting = false;
-  var _siteCancelled = false;
-  SiteLibraryProgress? _siteProgress;
-  String? _siteMessage;
-  String? _siteError;
-  var _siteLoaded = false;
+  bool get _anyImporting => _job.running || _externalImporting;
 
   @override
   void initState() {
     super.initState();
     _source.revision.addListener(_onRevision);
+    _jobService.state.addListener(_onJobState);
+    _lastJobPhase = _job.phase;
+    // 启动识别：上次导入被中断（标记残留）时给中文提示。
+    _jobService.ensureStartupChecked();
     _refresh();
-    _refreshSite();
   }
 
   @override
   void dispose() {
     _source.revision.removeListener(_onRevision);
+    // 只退订导入服务：任务在服务里继续跑，页面销毁不取消。
+    _jobService.state.removeListener(_onJobState);
     super.dispose();
+  }
+
+  void _onJobState() {
+    if (!mounted) return;
+    setState(() {});
+    // 任务刚成功收尾：刷新本页库状态（作品数/激活态）。
+    if (_job.phase == ImportJobPhase.succeeded &&
+        _lastJobPhase == ImportJobPhase.running) {
+      _refresh();
+    }
+    _lastJobPhase = _job.phase;
   }
 
   void _onRevision() {
@@ -197,15 +212,14 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     }
   }
 
-  /// 外置文件导入激活：走导入服务的 .db 同一条链（校验＋版本
-  /// 门＋拷入导入库＋落激活记录），外置文件只读不写。
+  /// 外置文件导入激活：走导入服务的 .db 同一条链（结构校验
+  /// ＋拷入导入库＋落激活记录），外置文件只读不写。
   Future<void> _importExternal() async {
-    if (_importing) return;
+    if (_externalImporting) return;
     setState(() {
-      _importing = true;
-      _message = null;
-      _error = null;
-      _progress = null;
+      _externalImporting = true;
+      _localMessage = null;
+      _localError = null;
     });
     try {
       final outcome = await _importService.importExternalFile(
@@ -213,14 +227,14 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       );
       if (!mounted) return;
       setState(() {
-        _importing = false;
+        _externalImporting = false;
         if (outcome.ok) {
-          _message = outcome.videos > 0
+          _localMessage = outcome.videos > 0
               ? '外置库导入成功，已激活：${outcome.videos} 部作品'
               : '外置库导入成功，已激活';
-          _error = null;
+          _localError = null;
         } else {
-          _error = outcome.error ?? '导入失败';
+          _localError = outcome.error ?? '导入失败';
         }
       });
       if (outcome.needsReload) await _notifyLibraryChanged();
@@ -228,8 +242,8 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _importing = false;
-        _error = '导入失败：${importFailureZh(e)}';
+        _externalImporting = false;
+        _localError = '导入失败：${importFailureZh(e)}';
       });
     }
   }
@@ -262,8 +276,8 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     await _notifyLibraryChanged();
     if (!mounted) return;
     setState(() {
-      _message = '导入库已删除，演员库已回到未激活状态';
-      _error = null;
+      _localMessage = '导入库已删除，演员库已回到未激活状态';
+      _localError = null;
     });
     await _refresh();
   }
@@ -271,8 +285,9 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
   /// 统一导入口（2026-11-28 统一导入口批）：全页唯一的导入
   /// 入口。点开选文件页（MYTV/db 全部可导文件＋页尾「选择其他
   /// 文件」），选定后由 [UnifiedImportSniffer] 按内容认库，再
-  /// 分发到各自原有的导入尾段（站点/女优/磁力，校验、版本门、
-  /// 落位语义一字不改）。原先散在三个区的六个导入按钮已全撤。
+  /// 分发到各自原有的导入尾段（女优/磁力走原导入链；合并文件
+  /// 走整库导入；单独的站点文件不再导入——站点已内置，只给
+  /// 提示）。原先散在三个区的六个导入按钮已全撤。
   Future<void> _startUnifiedImport() async {
     if (_anyImporting) return;
     final files = await _importService.listMytvDbImportFiles();
@@ -318,8 +333,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _unifiedError = '导入失败：${importFailureZh(e)}';
-        _unifiedMessage = null;
+        _localUnifiedError = '导入失败：${importFailureZh(e)}';
       });
       return;
     }
@@ -330,431 +344,36 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     );
   }
 
-  /// 认库＋分发：认出哪种库就调哪种库原有的导入尾段；认不出
-  /// 给中文提示、不瞎导。分发结果汇总到统一口一行（带库名），
-  /// 各区自己的结果文案照旧显示。
+  /// 发起统一导入：认库＋分发整体在 [UnifiedImportDispatch]
+  /// 里、由 [ImportJobService] 驱动（与页面解绑）。页面只把
+  /// 本页注入的服务依赖交给分发器，进度与结果订阅服务状态。
   Future<void> _runUnifiedImport({
     required String path,
     required String sourceName,
     required bool deleteAfter,
   }) async {
-    if (_importing || _magnetImporting || _siteImporting) return;
+    if (_job.running) return;
     setState(() {
-      _unifiedSniffing = true;
-      _unifiedMessage = null;
-      _unifiedError = null;
+      _localUnifiedError = null;
+      _localMessage = null;
+      _localError = null;
     });
-    final kind = await UnifiedImportSniffer.sniff(path);
-    if (!mounted) return;
-    setState(() => _unifiedSniffing = false);
-    switch (kind) {
-      case UnifiedImportKind.bundle:
-      case UnifiedImportKind.siteLibrary:
-        setState(() => _unifiedMessage = '已认出是${kind.labelZh}，正在导入…');
-        await _runSiteImport(File(path), deleteAfter: deleteAfter);
-        _mirrorUnifiedResult(kind);
-      case UnifiedImportKind.actressDb:
-      case UnifiedImportKind.actressSql:
-        setState(() => _unifiedMessage = '已认出是${kind.labelZh}，正在导入…');
-        await _runActressImport(path, deleteAfter: deleteAfter);
-        _mirrorUnifiedResult(kind);
-      case UnifiedImportKind.magnetSql:
-        setState(() => _unifiedMessage = '已认出是${kind.labelZh}，正在导入…');
-        await _runMagnetImport(
-          path,
-          sourceName: sourceName,
-          deleteAfter: deleteAfter,
-        );
-        _mirrorUnifiedResult(kind);
-      case UnifiedImportKind.unknown:
-        if (deleteAfter) {
-          try {
-            final file = File(path);
-            if (await file.exists()) await file.delete();
-          } catch (_) {}
-        }
-        setState(() {
-          _unifiedMessage = null;
-          _unifiedError =
-              '这份文件认不出是什么库（不是站点库、女优库、'
-              '磁力库，也不是三库合并文件），没有导入。'
-              '请确认文件没下错、没下坏。';
-        });
-    }
-  }
-
-  /// 把各库尾段的结果汇总到统一口一行（成功/失败都带库名）。
-  /// 合并文件按整库口径：一次导入、一次激活、全活或全没，
-  /// 不再逐段报三种命运。
-  void _mirrorUnifiedResult(UnifiedImportKind kind) {
-    if (!mounted) return;
-    if (kind == UnifiedImportKind.bundle) {
-      setState(() {
-        if (_bundleResultOk == true) {
-          _unifiedMessage =
-              '数据库导入成功，已激活：${_bundleResultText ?? ''}';
-          _unifiedError = null;
-        } else {
-          _unifiedMessage = null;
-          _unifiedError = '数据库没有导入：${_bundleResultText ?? '未知原因'}';
-        }
-      });
-      return;
-    }
-    final isSite = kind == UnifiedImportKind.siteLibrary;
-    final message = isSite ? _siteMessage : _message;
-    final error = isSite ? _siteError : _error;
-    setState(() {
-      if (error != null) {
-        _unifiedMessage = null;
-        _unifiedError = '${kind.labelZh}：$error';
-      } else if (message != null) {
-        _unifiedMessage = '${kind.labelZh}：$message';
-        _unifiedError = null;
-      }
-    });
-  }
-
-  /// 女优库导入共用尾段：进度、结果回报、成功后重读。
-  /// [deleteAfter] 只对收件副本为真；MYTV/db 源文件一字不动。
-  Future<void> _runActressImport(
-    String localPath, {
-    required bool deleteAfter,
-  }) async {
-    setState(() {
-      _importing = true;
-      _cancelled = false;
-      _message = null;
-      _error = null;
-      _progress = null;
-    });
-    try {
-      final outcome = await _importService.importLocalFile(
-        localPath: localPath,
-        closeDatabase: () => SqfliteActressDatabase.instance.close(),
-        onProgress: (progress) {
-          if (mounted) setState(() => _progress = progress);
-        },
-        isCancelled: () => _cancelled,
-      );
-      if (!mounted) return;
-      setState(() {
-        _importing = false;
-        _progress = null;
-        if (outcome.ok) {
-          _message = outcome.videos > 0
-              ? '导入成功，已激活：${outcome.videos} 部作品'
-                    '${outcome.warnings.isEmpty ? '' : '\n${outcome.warnings.join('\n')}'}'
-              : '导入成功，已激活';
-          _error = null;
-        } else {
-          _error = outcome.error ?? '导入失败';
-        }
-      });
-      if (outcome.needsReload) await _notifyLibraryChanged();
-      await _refresh();
-    } catch (e, stack) {
-      await ImportDebugLog.record(
-        stage: '女优库导入尾段（管理页）',
-        error: e,
-        stack: stack,
-      );
-      if (!mounted) return;
-      setState(() {
-        _importing = false;
-        _progress = null;
-        _error = '导入失败（女优库导入尾段）：${importFailureZh(e)}';
-      });
-    } finally {
-      if (deleteAfter) {
-        try {
-          final inbox = File(localPath);
-          if (await inbox.exists()) await inbox.delete();
-        } catch (_) {}
-      }
-    }
-  }
-
-  /// 空目标库的标准表 DDL（与 actress_sql_import.dart 的
-  /// _standardTableDdl 逐字一致）：导入槽为空时先建一本只有
-  /// 标准空表的目标库再合并，was_existing 全 0 起步（施工图
-  /// §1 口径）。数据层未提供建空库动作，这里在管理页侧凑齐。
-  static const _emptyTargetDdl = <String>[
-    'CREATE TABLE videos (vod_id TEXT PRIMARY KEY, title TEXT, pic_url TEXT, m3u8_url TEXT, vod_remarks TEXT, vod_pubdate TEXT, vod_area TEXT, vod_year TEXT, vod_content TEXT, vod_play_from TEXT, vod_play_url TEXT, type_name TEXT, created_at TEXT)',
-    'CREATE TABLE actresses (cate_id TEXT PRIMARY KEY, name TEXT, avatar TEXT, created_at TEXT, sex TEXT, roster_id TEXT, claimed INTEGER)',
-    'CREATE TABLE video_actress (vod_id TEXT, cate_id TEXT, PRIMARY KEY (vod_id, cate_id))',
-    'CREATE TABLE video_play_urls (vod_id TEXT, play_url TEXT, play_from TEXT, PRIMARY KEY (vod_id, play_url))',
-    'CREATE TABLE video_category (vod_id TEXT PRIMARY KEY, main_category TEXT)',
-    'CREATE TABLE video_tag (vod_id TEXT, tag_name TEXT, PRIMARY KEY (vod_id, tag_name))',
-  ];
-
-  /// 打开导入库作磁力合并/删库的目标连接：文件不存在时先建
-  /// 空目标库（标准空表 + 磁力登记表）。合并会改文件，先关主
-  /// 库连接，免得两条连接同写一本库。
-  Future<Database> _openMagnetTarget() async {
-    final importedPath = await _source.importedDbPath();
-    final file = File(importedPath);
-    final existed = file.existsSync() && file.lengthSync() > 0;
-    if (!existed) {
-      await file.parent.create(recursive: true);
-    }
-    try {
-      await SqfliteActressDatabase.instance.close();
-    } catch (_) {
-      // 主库连接没开着：关失败不挡合并。
-    }
-    final db = await openDatabase(importedPath, singleInstance: false);
-    if (!existed) {
-      for (final ddl in _emptyTargetDdl) {
-        await db.execute(ddl);
-      }
-    }
-    await ActressMagnetLibraryStore.ensureSchema(db);
-    return db;
-  }
-
-  /// 磁力分类库的导入入口已并入页面上方统一导入口（2026-11-28
-  /// 统一导入口批）：选文件后软件按内容认出磁力库、调下面这条
-  /// 共用尾段；本区只留已导入列表与删除。
-
-  /// 磁力分类库导入共用尾段：落归一化临时库 → 非磁力整单拒 →
-  /// 合并进导入库。[deleteAfter] 只对收件副本为真；MYTV/db 源
-  /// 文件一字不动。调用方负责先把 _magnetImporting 置真（MYTV/db
-  /// 路在弹窗选完后置真）。
-  Future<void> _runMagnetImport(
-    String localPath, {
-    required String sourceName,
-    required bool deleteAfter,
-  }) async {
-    setState(() {
-      _magnetImporting = true;
-      _magnetProgress = null;
-      _message = null;
-      _error = null;
-    });
-    String? stagingPath;
-    try {
-      // 临时库与目标库同目录（数据层缺省口径）；目录先建好，
-      // 免得导入器往不存在的目录落临时文件。
-      final importedPath = await _source.importedDbPath();
-      if (importedPath.isEmpty) {
-        throw StateError('导入库路径不可用，没法导入磁力分类库');
-      }
-      await File(importedPath).parent.create(recursive: true);
-      stagingPath = magnetStagingPathFor(importedPath);
-      final staging = await buildMagnetStagingDb(
-        localPath,
-        stagingPath: stagingPath,
-        onProgress: (progress) {
-          if (mounted) setState(() => _magnetProgress = progress);
-        },
-      );
-      if (!staging.ok) {
-        throw StateError(staging.error ?? '文件校验没通过');
-      }
-      // 非磁力整单拒（先验在开目标库之前：被拒时不建空目标
-      // 库、目标库一字不动）；合并内部还有同一道尺兜底。
-      if (!await ActressMagnetLibraryStore.stagingIsMagnetLibrary(
-        stagingPath,
-      )) {
-        throw StateError('这个文件里没有磁力链接，不是磁力分类库；整库数据库请用上面的「导入数据库」');
-      }
-      final db = await _openMagnetTarget();
-      MagnetImportOutcome outcome;
-      try {
-        outcome = await ActressMagnetLibraryStore().mergeStaging(
-          db,
-          stagingPath,
-          sourceName: sourceName,
-        );
-      } finally {
-        await db.close();
-      }
-      if (!outcome.ok) {
-        throw StateError(outcome.error ?? '导入失败');
-      }
-      _source.notifyChanged();
-      await _notifyLibraryChanged();
-      if (!mounted) return;
-      setState(() {
-        _magnetImporting = false;
-        _magnetProgress = null;
-        _message = _magnetImportResultText(outcome);
-        _error = null;
-      });
-      await _refresh();
-    } catch (e, stack) {
-      await ImportDebugLog.record(
-        stage: '磁力库导入尾段（管理页）',
-        error: e,
-        stack: stack,
-      );
-      if (!mounted) return;
-      setState(() {
-        _magnetImporting = false;
-        _magnetProgress = null;
-        _error = '磁力分类库导入失败：${importFailureZh(e)}';
-      });
-    } finally {
-      if (deleteAfter) {
-        try {
-          final inbox = File(localPath);
-          if (await inbox.exists()) await inbox.delete();
-        } catch (_) {}
-      }
-      // 临时库四件残件一并清（与数据层导入器的清理口径一致）。
-      if (stagingPath != null) {
-        for (final suffix in ['', '.bak', '-wal', '-journal']) {
-          try {
-            final staging = File('$stagingPath$suffix');
-            if (await staging.exists()) await staging.delete();
-          } catch (_) {}
-        }
-      }
-    }
-  }
-
-  String _magnetImportResultText(MagnetImportOutcome outcome) {
-    final String text;
-    if (outcome.categories.length > 1) {
-      text =
-          '已导入 ${outcome.categories.length} 个分类'
-          '（${outcome.categories.join('、')}）：'
-          '新增 ${outcome.addedWorks} 部作品'
-          '（共收录 ${outcome.totalWorks} 部）';
-    } else if (outcome.category.isNotEmpty) {
-      text =
-          '已导入分类「${outcome.category}」：'
-          '新增 ${outcome.addedWorks} 部作品'
-          '（这个分类共 ${outcome.totalWorks} 部）';
-    } else {
-      text = '已导入磁力分类库：新增 ${outcome.addedWorks} 部作品';
-    }
-    return outcome.replaced ? '$text；同名分类已更新为这一版' : text;
-  }
-
-  Future<void> _refreshSite() async {
-    try {
-      await _siteLibrary.load();
-    } catch (_) {
-      // 读不到就按未导入显示，不挡女优库那半页。
-    }
-    if (!mounted) return;
-    setState(() => _siteLoaded = true);
-  }
-
-  /// 导入成功/删除后通知注册链对账 SQL 站。syncSqlSites 由注册链
-  /// 批提供；本页先落时该方法可能还不存在，用 dynamic 调用、
-  /// 缺失/失败都静默（注册链启动时也会自己对账一次）。
-  Future<void> _syncSqlSites() async {
-    try {
-      await (SourceRegistry.instance as dynamic).syncSqlSites();
-    } catch (_) {}
-  }
-
-  /// 站点库的导入入口已并入页面上方统一导入口（2026-11-28
-  /// 统一导入口批）：选文件后软件按内容认出站点库/合并文件、
-  /// 调下面这条共用尾段；本区只留状态与删除。
-
-  /// 站点库导入共用尾段：进度、逐段回报、成功后注册链对账。
-  /// [deleteAfter] 只对收件副本为真；MYTV/db 源文件一字不动。
-  Future<void> _runSiteImport(File file, {required bool deleteAfter}) async {
-    setState(() {
-      _siteImporting = true;
-      _siteCancelled = false;
-      _siteMessage = null;
-      _siteError = null;
-      _siteProgress = null;
-    });
-    try {
-      final outcome = await _siteLibrary.importLocalFile(
-        localPath: file.path,
-        onProgress: (progress) {
-          if (mounted) setState(() => _siteProgress = progress);
-        },
-        isCancelled: () => _siteCancelled,
-      );
-      if (!mounted) return;
-      setState(() {
-        _siteImporting = false;
-        _siteProgress = null;
-        if (outcome.segmentResults.isNotEmpty) {
-          // 合并文件＝整份数据库：结果只记整库口径（统一口
-          // 汇总用），站点区不再挂自己的导入成败状态行。
-          _bundleResultOk = outcome.ok;
-          _bundleResultText = outcome.ok
-              ? [
-                  for (final r in outcome.segmentResults)
-                    if (r.ok) '${r.segmentLabel} ${r.detail ?? '已导入'}',
-                ].join('；')
-              : (outcome.error ?? '未知原因');
-          _siteMessage = null;
-          _siteError = null;
-        } else if (outcome.ok) {
-          _siteMessage =
-              '站点库导入成功：${outcome.stationCount} 个站'
-              '${outcome.libraryVersion == null ? '' : '（版本 ${outcome.libraryVersion}）'}';
-          _siteError = null;
-        } else {
-          _siteError = outcome.error ?? '导入失败';
-        }
-      });
-      if (outcome.ok) await _syncSqlSites();
-      await _refreshSite();
-    } catch (e, stack) {
-      await ImportDebugLog.record(
-        stage: '站点数据导入尾段（管理页）',
-        error: e,
-        stack: stack,
-      );
-      if (!mounted) return;
-      setState(() {
-        _siteImporting = false;
-        _siteProgress = null;
-        _siteError = '导入失败（站点数据导入尾段）：${importFailureZh(e)}';
-      });
-    } finally {
-      if (deleteAfter) {
-        try {
-          if (await file.exists()) await file.delete();
-        } catch (_) {}
-      }
-    }
-  }
-
-  Future<void> _deleteSiteLibrary() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: Neon.surface,
-        title: const Text('删除站点数据', style: TextStyle(color: Neon.text)),
-        content: const Text(
-          '删除后站点回到只有名单、点不开的状态（名单态），'
-          '要再用得重新导入站点库。女优库不受任何影响。',
-          style: TextStyle(color: Neon.textDim),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            key: const ValueKey('site-delete-confirm'),
-            onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('删除', style: TextStyle(color: Neon.pink)),
-          ),
-        ],
+    final dispatch = UnifiedImportDispatch(
+      source: _source,
+      importService: _importService,
+      siteLibrary: _siteLibrary,
+      onLibraryChanged: _notifyLibraryChanged,
+    );
+    await _jobService.start(
+      sourceName: sourceName,
+      runner: (onProgress, isCancelled) => dispatch.run(
+        path: path,
+        sourceName: sourceName,
+        deleteAfter: deleteAfter,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
       ),
     );
-    if (confirmed != true) return;
-    await _siteLibrary.deleteLibrary();
-    await _syncSqlSites();
-    if (!mounted) return;
-    setState(() {
-      _siteMessage = '站点数据已删除，站点已回到只有名单的状态';
-      _siteError = null;
-    });
-    await _refreshSite();
   }
 
   @override
@@ -772,8 +391,6 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
           children: [
             _importSection(),
-            const SizedBox(height: 12),
-            _siteLibrarySection(),
             if (_message != null) ...[
               const SizedBox(height: 10),
               Text(
@@ -822,7 +439,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
                               '演员库数据来自 MYTV/db/女优库.db，列表、'
                               '详情、播放照常可用；导入成功后导入库会'
                               '自动接管，兜底退场。'
-                        : '演员库还没激活：导入一个带版本字段的女优库'
+                        : '演员库还没激活：导入一个女优库'
                               '（.db / .sql）完成激活后才能用；也可以在'
                               '下面外置库卡上点「导入激活」。',
                     style: const TextStyle(color: Neon.textDim, fontSize: 12),
@@ -900,8 +517,9 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
           const Text(
             '所有数据都从这一个口导入：把文件放进 MYTV/db，点下面按钮选文件，'
             '软件会按文件内容自动认库。三库合并文件就是一整份数据库，'
-            '一次导入、一次激活，站点、演员库、磁力一起生效'
-            '（校验和整库版本门照旧，导入失败时现有库原样不动）。'
+            '一次导入、一次激活，演员库、磁力一起生效'
+            '（会先做结构校验，导入失败时现有库原样不动）。'
+            '站点已经内置在软件里，不用单独导入。'
             '文件不在 MYTV/db 里的小文件，在选文件页里点「选择其他文件」。',
             style: TextStyle(color: Neon.textDim, fontSize: 12),
           ),
@@ -913,7 +531,8 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
               style: const TextStyle(color: Neon.cyan, fontSize: 13),
             ),
           ],
-          if (_unifiedError != null) ...[
+          if (_unifiedError != null &&
+              _job.phase != ImportJobPhase.interrupted) ...[
             const SizedBox(height: 8),
             Text(
               _unifiedError!,
@@ -927,88 +546,88 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
               style: TextStyle(color: Neon.textDim, fontSize: 12),
             ),
           ],
-          if (_unifiedSniffing) ...[
-            const SizedBox(height: 10),
-            const LinearProgressIndicator(
-              color: Neon.cyan,
-              backgroundColor: Neon.surfaceHigh,
-            ),
-            const SizedBox(height: 6),
+          if (_job.phase == ImportJobPhase.interrupted) ...[
+            const SizedBox(height: 8),
             const Text(
-              '正在认这份文件是什么库…',
-              key: ValueKey('unified-import-sniffing'),
-              style: TextStyle(color: Neon.textDim, fontSize: 12),
+              ImportJobService.interruptedHintZh,
+              key: ValueKey('unified-import-interrupted'),
+              style: TextStyle(color: Neon.pink, fontSize: 13),
             ),
-          ] else if (_importing) ...[
+          ],
+          if (_job.running) ...[
             const SizedBox(height: 10),
             LinearProgressIndicator(
-              value: (_progress?.fraction ?? 0).clamp(0, 1),
-              color: Neon.cyan,
-              backgroundColor: Neon.surfaceHigh,
-            ),
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _progress == null
-                        ? '正在导入女优库…'
-                        : '${_progress!.phase}…已处理 ${_progress!.statements} 条',
-                    style: const TextStyle(color: Neon.textDim, fontSize: 12),
-                  ),
-                ),
-                TextButton(
-                  key: const ValueKey('dual-import-cancel'),
-                  onPressed: () => _cancelled = true,
-                  child: const Text('取消'),
-                ),
-              ],
-            ),
-          ] else if (_siteImporting) ...[
-            const SizedBox(height: 10),
-            LinearProgressIndicator(
-              value: (_siteProgress?.fraction ?? 0).clamp(0, 1),
-              color: Neon.cyan,
-              backgroundColor: Neon.surfaceHigh,
-            ),
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _siteProgress == null
-                        ? '正在导入站点库…'
-                        : '${_siteProgress!.phase}…已处理 ${_siteProgress!.statements} 条',
-                    style: const TextStyle(color: Neon.textDim, fontSize: 12),
-                  ),
-                ),
-                TextButton(
-                  key: const ValueKey('site-import-cancel'),
-                  onPressed: () => _siteCancelled = true,
-                  child: const Text('取消'),
-                ),
-              ],
-            ),
-          ] else if (_magnetImporting) ...[
-            const SizedBox(height: 10),
-            LinearProgressIndicator(
-              value: _magnetProgress == null
+              value: _job.progress == null ||
+                      _job.progress!.kind == 'sniff'
                   ? null
-                  : (_magnetProgress!.fraction).clamp(0, 1),
+                  : (_job.progress!.fraction).clamp(0, 1),
               color: Neon.cyan,
               backgroundColor: Neon.surfaceHigh,
             ),
             const SizedBox(height: 6),
-            Text(
-              _magnetProgress == null
-                  ? '正在导入磁力库…'
-                  : '正在导入磁力库…已处理 '
-                        '${_magnetProgress!.statements} 条'
-                        '（${(_magnetProgress!.fraction * 100).toStringAsFixed(0)}%）',
-              key: const ValueKey('magnet-import-progress'),
-              style: const TextStyle(color: Neon.textDim, fontSize: 12),
+            if (_job.progress == null ||
+                _job.progress!.kind == 'sniff') ...[
+              const Text(
+                '正在认这份文件是什么库…',
+                key: ValueKey('unified-import-sniffing'),
+                style: TextStyle(color: Neon.textDim, fontSize: 12),
+              ),
+            ] else if (_job.progress!.kind == 'magnet') ...[
+              Text(
+                '正在导入磁力库…已处理 '
+                '${_job.progress!.statements} 条'
+                '（${(_job.progress!.fraction * 100).toStringAsFixed(0)}%）',
+                key: const ValueKey('magnet-import-progress'),
+                style: const TextStyle(color: Neon.textDim, fontSize: 12),
+              ),
+            ] else ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _job.progress!.kind == 'site' &&
+                              _job.progress!.statements == 0
+                          ? '正在导入数据库…'
+                          : '${_job.progress!.phaseLabel}…已处理 ${_job.progress!.statements} 条',
+                      style: const TextStyle(
+                        color: Neon.textDim,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    key: ValueKey(
+                      _job.progress!.kind == 'site'
+                          ? 'site-import-cancel'
+                          : 'dual-import-cancel',
+                    ),
+                    onPressed: () => _jobService.cancel(),
+                    child: const Text('取消'),
+                  ),
+                ],
+              ),
+            ],
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                key: const ValueKey('dual-import-button'),
+                onPressed: null,
+                icon: const Icon(Icons.folder_open_rounded, size: 18),
+                label: const Text('导入进行中…'),
+              ),
             ),
-          ] else
+          ] else ...[
+            if (_job.phase == ImportJobPhase.succeeded ||
+                _job.phase == ImportJobPhase.failed ||
+                _job.phase == ImportJobPhase.interrupted)
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  key: const ValueKey('unified-import-dismiss'),
+                  onPressed: () => _jobService.dismissResult(),
+                  child: const Text('关闭提示'),
+                ),
+              ),
             Align(
               alignment: Alignment.centerRight,
               child: TextButton.icon(
@@ -1018,90 +637,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
                 label: const Text('从 MYTV/db 导入'),
               ),
             ),
-        ],
-      ),
-    );
-  }
-
-  Widget _siteLibrarySection() {
-    final service = _siteLibrary;
-    final imported = _siteLoaded && service.imported;
-    final rejection = _siteLoaded ? service.loadRejectionReason : null;
-    final statusText = !_siteLoaded
-        ? '正在读取站点状态…'
-        : rejection != null
-        ? '版本不符，未激活：$rejection'
-        : imported
-        ? '已随数据库激活 · 版本 ${service.libraryVersion ?? '未知'}'
-              ' · ${service.stations.length} 个站'
-              ' · 大小 ${_formatSize(service.libraryFileSizeBytes)}'
-        : '未激活：随数据库一起激活，导入数据库后可用（现在只有名单，点不开）';
-    return Container(
-      key: const ValueKey('site-library-card'),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Neon.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Neon.violet.withValues(alpha: .45)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            '站点（随数据库激活）',
-            style: TextStyle(
-              color: Neon.text,
-              fontSize: 15,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            '站点数据就装在那份数据库里，不单独成库、不用单独导入：'
-            '导入并激活数据库时站点一并激活。没导入数据库时站点'
-            '列表只有名单、点不开。导入用页面上方唯一的'
-            '「导入数据库」入口，进度也在上方入口里看。',
-            style: TextStyle(color: Neon.textDim, fontSize: 12),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '状态：$statusText',
-            key: const ValueKey('site-library-status'),
-            style: TextStyle(
-              color: rejection != null ? Neon.pink : Neon.textDim,
-              fontSize: 12,
-            ),
-          ),
-          if (_siteMessage != null) ...[
-            const SizedBox(height: 8),
-            Text(
-              _siteMessage!,
-              key: const ValueKey('site-message'),
-              style: const TextStyle(color: Neon.cyan, fontSize: 13),
-            ),
           ],
-          if (_siteError != null) ...[
-            const SizedBox(height: 8),
-            Text(
-              _siteError!,
-              key: const ValueKey('site-error'),
-              style: const TextStyle(color: Neon.pink, fontSize: 13),
-            ),
-            const SizedBox(height: 4),
-            const Text(
-              '详细原因已存到 ${ImportDebugLog.pathHintZh}。',
-              style: TextStyle(color: Neon.textDim, fontSize: 12),
-            ),
-          ],
-          if (imported && !_siteImporting)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: OutlinedButton(
-                key: const ValueKey('site-delete'),
-                onPressed: _deleteSiteLibrary,
-                child: const Text('删除站点数据', style: TextStyle(color: Neon.pink)),
-              ),
-            ),
         ],
       ),
     );
@@ -1194,10 +730,10 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
           if (slot == ActressDbSlot.external && info.exists) ...[
             const SizedBox(height: 4),
             const Text(
-              '这个文件是导入来源：点下面「导入激活」会校验版本并拷进导入库正式生效；'
+              '这个文件是导入来源：点下面「导入激活」会校验结构并拷进导入库正式生效；'
               '未激活时只要它结构过关，演员库会自动拿它只读兜底出数据。'
               '它显示的作品数和修改时间是这份文件本身的；'
-              '没有版本字段的老库点导入激活会按存量库放行，不用换文件。',
+              '老库也能直接导入，不用换文件。',
               style: TextStyle(color: Neon.textFaint, fontSize: 11),
             ),
           ],
@@ -1215,7 +751,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
               if (slot == ActressDbSlot.external && info.exists)
                 OutlinedButton(
                   key: const ValueKey('dual-import-external'),
-                  onPressed: _importing ? null : _importExternal,
+                  onPressed: _anyImporting ? null : _importExternal,
                   child: const Text('导入激活'),
                 ),
               if (slot == ActressDbSlot.imported && info.exists)
@@ -1235,10 +771,10 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
                         .grantFolderAccess();
                     if (!mounted) return;
                     setState(() {
-                      _message = granted
+                      _localMessage = granted
                           ? '已取得文件夹授权，正在重新读取'
                           : '没有选择文件夹，或系统选择器打不开';
-                      _error = null;
+                      _localError = null;
                     });
                     if (granted) {
                       await ActressMytvBind.instance.ensureBound(refresh: true);
@@ -1255,10 +791,10 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
                         .grantFileAccess();
                     if (!mounted) return;
                     setState(() {
-                      _message = granted
+                      _localMessage = granted
                           ? '已取得文件授权，正在重新读取'
                           : '没有选择文件，或系统选择器打不开';
-                      _error = null;
+                      _localError = null;
                     });
                     if (granted) {
                       await ActressMytvBind.instance.ensureBound(refresh: true);

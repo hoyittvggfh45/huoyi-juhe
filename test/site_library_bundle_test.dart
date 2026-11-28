@@ -30,6 +30,7 @@ class _BundleFixture {
     this.actressCoreVersion = '2026.11.27',
     this.tamperBundleSignature = false,
     this.tamperMagnetDeclaredPayload = false,
+    this.bundleFormatVersion = '1',
   }) {
     final demoCode = "print('hi')\n";
     siteStationRows = [
@@ -71,6 +72,7 @@ class _BundleFixture {
   final String actressCoreVersion;
   final bool tamperBundleSignature;
   final bool tamperMagnetDeclaredPayload;
+  final String bundleFormatVersion;
 
   late final List<Map<String, Object?>> siteStationRows;
   late final List<Map<String, Object?>> siteCodeRows;
@@ -139,7 +141,7 @@ class _BundleFixture {
     });
     return {
       'bundle_format': 'fanren_bundle',
-      'format_version': '1',
+      'format_version': bundleFormatVersion,
       'core_version': '2026.11.27',
       'bundle_version': '20261127',
       'segments': 'site,actress,magnet',
@@ -436,20 +438,26 @@ void main() {
       return outcome;
     }
 
-    test('三段全过：逐段落位、站数与逐段结果齐', () async {
+    test('三段全过：演员/磁力落位、站点段跳过、逐段结果齐', () async {
       final outcome = await runImport();
       expect(outcome, isNotNull);
       expect(outcome!.ok, isTrue, reason: outcome.error);
-      expect(outcome.stationCount, 1);
+      // 站点已内置：站数不再由 bundle 落位产出。
+      expect(outcome.stationCount, 0);
       expect(outcome.segmentResults, hasLength(3));
       expect(outcome.segmentResults.every((r) => r.ok), isTrue);
-      expect(materializer.calls, ['site', 'actress', 'magnet']);
+      final siteResult = outcome.segmentResults
+          .firstWhere((r) => r.segment == 'site');
+      expect(siteResult.detail, contains('已跳过'));
+      expect(siteResult.detail, contains('站点已内置'));
+      // 物化只走 actress/magnet 两段，站点段不物化不落位。
+      expect(materializer.calls, ['actress', 'magnet']);
       expect(actressLanded, hasLength(1));
       expect(magnetLanded, hasLength(1));
-      // 站点库已换新、旧库进 .bak。
+      // 站点库文件一字不动、无 .bak。
       final siteDbPath = '${tempDir.path}/site_library/site_library.db';
-      expect(await File(siteDbPath).readAsString(), 'SEGDB-site');
-      expect(await File('$siteDbPath.bak').readAsString(), 'OLDDB');
+      expect(await File(siteDbPath).readAsString(), 'OLDDB');
+      expect(await File('$siteDbPath.bak').exists(), isFalse);
       // staging 与段临时文件清干净。
       expect(
         await File(
@@ -465,10 +473,27 @@ void main() {
       );
     });
 
-    test('段清单版本字段不符：不再单独拒段（版本门只留整库一道），三段照常全落', () async {
-      // 2026-11-28 设计令：站点绑定数据库激活、版本门只留
-      // 整库一道。段 manifest 的 core_version 与整库不一致
-      // 不再是拒收理由（整文件清单的版本已在整库层验过）。
+    test('整库 format_version 写 2 与 2099：照常整份导入（2026-11-28 版本门全拆）', () async {
+      // G15 整库格式门此前无专测：拆门后 bundle_manifest 的
+      // format_version 写任意值都只随清单留痕，整份照常导入
+      // （签名/哈希按段 payload 算、与 format 值无关，夹具
+      // 改 format 不影响自洽）。
+      for (final v in ['2', '2099']) {
+        final outcome = await runImport(
+          useFixture: _BundleFixture(bundleFormatVersion: v),
+        );
+        expect(outcome, isNotNull);
+        expect(outcome!.ok, isTrue, reason: 'format_version=$v: ${outcome.error}');
+        expect(outcome.segmentResults.every((r) => r.ok), isTrue);
+      }
+      expect(actressLanded, hasLength(2));
+      expect(magnetLanded, hasLength(2));
+    });
+
+    test('段清单版本字段不符：不拒段，演员/磁力照常落位', () async {
+      // 2026-11-28 版本门全拆：段 manifest 的 core_version
+      // 与整库不一致不再是拒收理由，整文件层同样不比对
+      // 版本字段（只验清单/payload/签名）。
       final outcome = await runImport(
         useFixture: _BundleFixture(actressCoreVersion: '1999.01.01'),
       );
@@ -641,7 +666,7 @@ void main() {
       );
     });
 
-    test('合并文件经服务层：逐段结果回来、站点段落位后服务已导入', () async {
+    test('合并文件经服务层：逐段结果回来、站点段报已跳过', () async {
       final fixture = _BundleFixture();
       final probe = _BundleFakeExecutor(fixture);
       fixture.magnetPayload = await computeBundleSegmentPayload(
@@ -679,11 +704,15 @@ void main() {
       expect(outcome.ok, isTrue, reason: outcome.error);
       expect(outcome.segmentResults, hasLength(3));
       expect(outcome.segmentResults.every((r) => r.ok), isTrue);
-      // 站点段落位后服务层 load() 刷新成已导入态。
-      expect(service.imported, isTrue);
+      // 站点段不落位（站点已内置）：段结果报已跳过，站点库
+      // 落点文件不产生。服务层自身的站点状态口径归站点库
+      // 负责人，本例只断言 bundle 路由与逐段结果。
+      final siteResult = outcome.segmentResults
+          .firstWhere((r) => r.segment == 'site');
+      expect(siteResult.detail, contains('已跳过'));
       expect(
-        await File('${libDir.path}/site_library.db').readAsString(),
-        'SEGDB-site',
+        await File('${libDir.path}/site_library.db').exists(),
+        isFalse,
       );
     });
   });

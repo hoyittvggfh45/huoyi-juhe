@@ -3,8 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart' show ByteData, rootBundle;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
 import 'import_debug_log.dart';
@@ -30,7 +31,10 @@ import 'sql_text_stream.dart';
 /// 站点库签名密钥（与生成器钉死）：HMAC-SHA256 的 key。
 const siteLibrarySignKey = 'xiuxian-site-library-v1';
 
-/// 本软件支持的站点库格式版本（manifest.format_version 必须等于它）。
+/// 历史常量：站点库格式版本门已于 2026-11-28 拆除（用户令
+/// 「数据库版本彻底取消」），本常量不再参与任何比对，仅作旧
+/// 注入通道的兼容默认值留痕。版本三字段仍是签名 payload 的
+/// 组成部分，验签照旧覆盖、只是不与期望值比对。
 const siteLibrarySupportedFormatVersion = '1';
 
 /// 本软件的核心版本。2026-11-28 取消核心门后只作留痕（生成
@@ -366,7 +370,6 @@ class SiteLibraryImporter {
   SiteLibraryImporter({
     this.batchSize = 1000,
     this.currentCoreVersion = siteLibraryDefaultCoreVersion,
-    this.supportedFormatVersion = siteLibrarySupportedFormatVersion,
     Future<SiteLibrarySqlExecutor> Function(String tempPath)?
     executorFactory,
   }) : _executorFactory =
@@ -383,9 +386,6 @@ class SiteLibraryImporter {
 
   /// 兼容保留字段：取消核心门后不再参与比对（见文件头常量）。
   final String currentCoreVersion;
-
-  /// 版本门：manifest.format_version 必须等于它。
-  final String supportedFormatVersion;
 
   final Future<SiteLibrarySqlExecutor> Function(String tempPath)
   _executorFactory;
@@ -584,9 +584,10 @@ class SiteLibraryImporter {
   }
 
   /// 全量校验（还在临时库上，不合格抛中文错、旧库不动）：
-  /// format/版本对 → station_count 与 manifest 一致 → 每行
+  /// format 对 → station_count 与 manifest 一致 → 每行
   /// code_sha256 与 code_text 实算一致 → payload 重算一致 →
-  /// HMAC 验签（缺失/不符整库拒）。
+  /// HMAC 验签（缺失/不符整库拒）。版本字段不设门（2026-11-28
+  /// 令拆净）：它们只是签名 payload 的材料，验签覆盖即可。
   Future<({String version, int count})> _validate(
     SiteLibrarySqlExecutor executor,
   ) async {
@@ -603,9 +604,6 @@ class SiteLibraryImporter {
     }
     if (meta['format'] != 'site_library') {
       throw StateError('不是站点库（format 不对）');
-    }
-    if (meta['schema_version'] != '1') {
-      throw StateError('站点库版本不受支持：${meta['schema_version'] ?? '未知'}');
     }
     List<Map<String, Object?>> manifestRows;
     List<Map<String, Object?>> stationRows;
@@ -688,19 +686,10 @@ class SiteLibraryImporter {
     if ('$signature' != computeSiteLibrarySignature(payload)) {
       throw StateError('站点库签名不对，已拒绝');
     }
-    // 版本门（与哈希/验签同层）：签名验过说明版本字段是生成器
-    // 原样写下的，此时格式版本对不上就是库与软件不配套，整库
-    // 拒、原因写明两边版本。放在验签之后，篡改版本字段会先死
-    // 在 payload 对不上那一步。
-    // 核心版本不再设门（2026-11-28 13:25 用户令「取消这
-    // 个」）：coreVersion 带什么值都不拒，只随清单留痕（它仍
-    // 是签名 payload 的一部分，验签照旧覆盖它）。
-    if ('${formatVersion ?? ''}' != supportedFormatVersion) {
-      throw StateError(
-        '站点库格式版本 ${formatVersion ?? '未知'} 与当前软件支持的 '
-        '$supportedFormatVersion 不符，已拒绝',
-      );
-    }
+    // 版本门已全拆（2026-11-28 用户令「数据库版本彻底取消」）：
+    // format_version / core_version / schema_version 带什么值都
+    // 不拒；三者仍是签名 payload 的组成部分（上面 M 行），篡改
+    // 任一都会先死在 payload 对不上那一步——那是验签、不是门。
     return (version: version, count: stationRows.length);
   }
 
@@ -733,17 +722,15 @@ class SiteLibraryService {
     this._bundleImporter,
     Future<SiteLibrarySqlExecutor> Function(String path)? readExecutorFactory,
     Future<String> Function(String assetPath)? assetLoader,
+    Future<ByteData> Function(String assetPath)? assetBytesLoader,
+    Future<SharedPreferences> Function()? prefsProvider,
     this.currentCoreVersion = siteLibraryDefaultCoreVersion,
-    this.supportedFormatVersion = siteLibrarySupportedFormatVersion,
   }) : _supportDirectoryProvider =
            supportDirectoryProvider ?? getApplicationSupportDirectory,
        _publicRootProvider = publicRootProvider ?? PublicFolder.publicRoot,
        _importer =
            importer ??
-           SiteLibraryImporter(
-             currentCoreVersion: currentCoreVersion,
-             supportedFormatVersion: supportedFormatVersion,
-           ),
+           SiteLibraryImporter(currentCoreVersion: currentCoreVersion),
        _readExecutorFactory =
            readExecutorFactory ??
            ((path) async {
@@ -754,7 +741,10 @@ class SiteLibraryService {
              );
              return SqfliteSiteLibraryExecutor(db);
            }),
-       _assetLoader = assetLoader ?? rootBundle.loadString;
+       _assetLoader = assetLoader ?? rootBundle.loadString,
+       _assetBytesLoader =
+           assetBytesLoader ?? ((path) => rootBundle.load(path)),
+       _prefsProvider = prefsProvider ?? SharedPreferences.getInstance;
 
   static SiteLibraryService get instance => _shared;
   static final SiteLibraryService _shared = SiteLibraryService();
@@ -762,22 +752,22 @@ class SiteLibraryService {
   /// 兼容保留字段：取消核心门后不再参与比对（见文件头常量）。
   final String currentCoreVersion;
 
-  /// 支持的站点库格式版本：库的 format_version 必须等于它。
-  final String supportedFormatVersion;
-
   final Future<Directory> Function() _supportDirectoryProvider;
 
   /// 手机根目录提供者（MYTV/db 直读入口用；测试可注入）。
   final Future<String> Function() _publicRootProvider;
   final SiteLibraryImporter _importer;
 
-  /// 合并文件分段导入器（可注入；缺省按需现建，版本口径随服务）。
+  /// 合并文件分段导入器（可注入；缺省按需现建）。
   final SiteLibraryBundleImporter? _bundleImporter;
   final Future<SiteLibrarySqlExecutor> Function(String path)
   _readExecutorFactory;
   final Future<String> Function(String assetPath) _assetLoader;
+  final Future<ByteData> Function(String assetPath) _assetBytesLoader;
+  final Future<SharedPreferences> Function() _prefsProvider;
 
   var _imported = false;
+  var _bundledLoad = false;
   String? _libraryVersion;
   var _stations = <SiteLibraryStation>[];
   var _libraryFileSizeBytes = 0;
@@ -792,9 +782,14 @@ class SiteLibraryService {
 
   String? get libraryVersion => _libraryVersion;
 
-  /// 已落盘库未被激活的原因（中文）：版本不符时 load() 写这里，
-  /// 文件保留不删、供排查与管理页状态卡显示；正常/未导入时为 null。
+  /// 已落盘库未被激活的原因（中文）：只剩结构问题（如缺清单
+  /// 行）时 load() 写这里，文件保留不删、仅供内部排查；版本门
+  /// 已拆、版本值不再写进这里。正常/未导入时为 null。
   String? get loadRejectionReason => _loadRejectionReason;
+
+  /// 当前装载的站点库是不是包内打包库（首启静默装载的那份）。
+  /// 注册链据此给打包站打 bundled 标记、进影视内置区。
+  bool get isBundledLoad => _bundledLoad;
 
   List<SiteLibraryStation> get stations =>
       List.unmodifiable(_stations);
@@ -884,17 +879,12 @@ class SiteLibraryService {
       final version = manifestRows.isEmpty
           ? null
           : '${manifestRows.first['library_version']}';
-      // 版本门：已落盘库版本不符就不激活（文件保留不删，供排查），
-      // 原因写进 loadRejectionReason 给管理页状态卡显示。
-      final rejection = manifestRows.isEmpty
-          ? '站点库缺清单行（manifest）'
-          : _versionRejection(
-              formatVersion: manifestRows.first['format_version'],
-              coreVersion: manifestRows.first['core_version'],
-            );
-      if (rejection != null) {
+      // 版本门已拆（2026-11-28 令）：落盘库只查结构——清单行
+      // 缺失仍不激活（文件保留不删，原因写 loadRejectionReason
+      // 仅供内部排查）；版本字段带什么值都不拦。
+      if (manifestRows.isEmpty) {
         _resetState();
-        _loadRejectionReason = rejection;
+        _loadRejectionReason = '站点库缺清单行（manifest）';
         LiveSources.sqlSources = [];
         return;
       }
@@ -1086,6 +1076,59 @@ class SiteLibraryService {
 
   bool isGatedNative(String id) => gatedNativeIds.contains(id);
 
+  /// 包内打包站点库资产（站点段单段化后 gzip 随包，639 站）。
+  static const bundledSiteLibraryAssetPath =
+      'assets/site_library/site_library.sql.gz';
+
+  /// 打包资产内容戳的 prefs 键：存资产字节的 sha256（内容戳，
+  /// 不是版本号——版本概念已按 2026-11-28 令取消）。
+  static const _bundledAssetStampKey = 'site_library_bundled_asset_sha256_v1';
+
+  /// 首启静默装载打包站点库（2026-11-28 取消激活令）：读包内
+  /// 资产，以资产内容 sha256 为戳——戳与当前资产一致且正式库
+  /// 文件在，只 load() 读回（其内部另有文件戳缓存）；否则把
+  /// 资产落临时 .sql.gz、走单段导入路（全套结构/哈希/验签校
+  /// 验）落盘成正式库并记戳。本版起站点以打包为准：老用户已
+  /// 有自己导入的站点库、但还没有打包戳时，也装载一次覆盖
+  /// （内容同源 639 站，无损）。全程 fail-soft：任何失败只当
+  /// 没装上，绝不抛、不挡启动。
+  Future<void> ensureBundledSiteLibraryLoaded() async {
+    try {
+      final data = await _assetBytesLoader(bundledSiteLibraryAssetPath);
+      final bytes = data.buffer.asUint8List(
+        data.offsetInBytes,
+        data.lengthInBytes,
+      );
+      if (bytes.isEmpty) return;
+      final assetSha = sha256.convert(bytes).toString();
+      final prefs = await _prefsProvider();
+      final stamp = prefs.getString(_bundledAssetStampKey);
+      final dir = await _libraryDir();
+      final dbFile = File('${dir.path}/site_library.db');
+      if (stamp == assetSha && await dbFile.exists()) {
+        await load();
+        if (_imported) _bundledLoad = true;
+        return;
+      }
+      await dir.create(recursive: true);
+      final tmp = File('${dir.path}/bundled_site_library.sql.gz');
+      await tmp.writeAsBytes(bytes, flush: true);
+      try {
+        final outcome = await importLocalFile(localPath: tmp.path);
+        if (outcome.ok) {
+          _bundledLoad = true;
+          await prefs.setString(_bundledAssetStampKey, assetSha);
+        }
+      } finally {
+        try {
+          await tmp.delete();
+        } catch (_) {}
+      }
+    } catch (_) {
+      // fail-soft：打包站点装不上不挡启动，名单态照常可用。
+    }
+  }
+
   /// 导入本地 .sql/.sql.gz：流式执行到临时库→全量校验（含验签）
   /// →先验后换→load() 刷新。失败/取消旧库一字不动。
   /// 文件是合并文件（三段）时先粗扫分流到分段导入器：站点段
@@ -1106,12 +1149,7 @@ class SiteLibraryService {
       maybeBundle = false;
     }
     if (maybeBundle) {
-      final bundleImporter =
-          _bundleImporter ??
-          SiteLibraryBundleImporter(
-            currentCoreVersion: currentCoreVersion,
-            supportedFormatVersion: supportedFormatVersion,
-          );
+      final bundleImporter = _bundleImporter ?? SiteLibraryBundleImporter();
       final bundleOutcome = await bundleImporter.importBundle(
         sqlPath: localPath,
         siteDbPath: '${dir.path}/site_library.db',
@@ -1165,6 +1203,7 @@ class SiteLibraryService {
       }
     } catch (_) {}
     _resetState();
+    _bundledLoad = false;
     LiveSources.sqlSources = [];
   }
 
@@ -1175,20 +1214,6 @@ class SiteLibraryService {
     _libraryFileSizeBytes = 0;
     _stamp = null;
     _loadRejectionReason = null;
-  }
-
-  /// 版本门判定：格式版本对不上回中文原因；对了返回 null。
-  /// [coreVersion] 自 2026-11-28 取消核心门后不再比对（用户
-  /// 令），保留参数兼容旧调用点，传什么都不影响结果。
-  String? _versionRejection({
-    required Object? formatVersion,
-    required Object? coreVersion,
-  }) {
-    if ('${formatVersion ?? ''}' != supportedFormatVersion) {
-      return '站点库格式版本 ${formatVersion ?? '未知'} 与当前软件支持的 '
-          '$supportedFormatVersion 不符';
-    }
-    return null;
   }
 
   static String? _nullableText(Object? value) {

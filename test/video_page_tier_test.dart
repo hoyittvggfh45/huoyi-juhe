@@ -8,7 +8,8 @@ import 'embedded_test_entries.dart';
 /// 影视页按境界过滤：成人站按修为分 4 档自动解锁，未解锁的站完全
 /// 不在列表里出现（不灰掉、不占位、不露站名）；内嵌站的行 id 是种子
 /// `seed_<id>` / jar `jar:zakatv:<key>`，查档位时归一化成核心站 id；
-/// 从未进过核心的站不分档、原样保留。
+/// 库内未标成人的站不分档、原样保留（2026-11-28 起库内标成人的站
+/// 已全量补进分档表，见 adult_gate_alignment_test）。
 void main() {
   /// 门禁开关：生产默认值 true（测试期临时关闭）会放行全部档位，
   /// 分档断言须先关掉，用完恢复。
@@ -31,8 +32,10 @@ void main() {
     expect(ids.contains('seed_abjav'), isFalse);
     expect(ids.contains('jar:zakatv:zakaaiye'), isFalse);
     expect(ids.contains('jar:zakatv:av18avmcg'), isFalse);
-    // 不分档的站原样保留：从未进核心的 jar 站与 YouTube。
-    expect(ids.contains('jar:zakatv:zakajavverse'), isTrue);
+    // 不分档的站原样保留：YouTube。javverse 库内标成人，
+    // 2026-11-28 已补进分档表（第 4 档），修为 0 不再露出
+    //（此前从未进核心、不分档原样保留）。
+    expect(ids.contains('jar:zakatv:zakajavverse'), isFalse);
     expect(ids.contains('jar:youtube:youtube'), isTrue);
     // 列表里一个分档站都不剩：每个 id 查档位都是 null。
     for (final id in ids) {

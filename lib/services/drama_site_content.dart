@@ -334,6 +334,65 @@ String huangdouHlsKeyHex(String rawKey) {
   return rawKey;
 }
 
+/// 红果系 vid 形态：旧形态是纯数字 id，新形态是 `v1_` 开头的不透明
+/// 令牌（字母数字与 `_`/`-` 混排）。两种都认，空串、超长与带其他
+/// 字符的一律不认，避免把页面杂质当分集。
+bool _isHongguoVid(String videoId) =>
+    videoId.isNotEmpty &&
+    videoId.length <= 128 &&
+    RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(videoId);
+
+/// 红果系搜索结果行 → 卡片：页面内嵌数据与 `/api/search/result`
+/// 接口的 `searchList` 同形（行内 `video_data` 优先），红果与红果
+/// 镜像共用这一份映射，不各写一套。
+List<DramaSiteItem> _itemsFromHongguoSearchRows(List<dynamic> rawList) {
+  final seen = <String>{};
+  final items = <DramaSiteItem>[];
+  for (final raw in rawList) {
+    var node = _asMap(raw);
+    final video = _asMap(node['video_data']);
+    if (video.isNotEmpty) node = video;
+    final id = _stringOf(
+      node['series_id_str'] ?? node['series_id'] ?? node['keyword'],
+    );
+    if (!RegExp(r'^\d+$').hasMatch(id) || seen.contains(id)) continue;
+    final title = _stringOf(
+      node['series_title'] ?? node['series_name'] ?? node['title'] ?? node['name'],
+    );
+    if (title.isEmpty) continue;
+    var remark = _stringOf(node['episode_right_text']);
+    if (remark.isEmpty) {
+      final count = _stringOf(node['episode_cnt']);
+      if (count.isNotEmpty) remark = '共$count集';
+    }
+    seen.add(id);
+    items.add(
+      DramaSiteItem(
+        id: id,
+        title: title,
+        cover: _stringOf(node['series_cover'] ?? node['cover']),
+        remark: remark,
+      ),
+    );
+  }
+  return items;
+}
+
+/// 红果搜索接口的响应解析：`GET /api/search/result?query=` 回的
+/// JSON 顶层就是 `searchList`（2026-11-28 实测匿名可取、字段与旧
+/// 页面内嵌数据一致）。解析不出回空表，调用方自行决定兜底。
+List<DramaSiteItem> parseHongguoSearchApi(String body) {
+  dynamic decoded;
+  try {
+    decoded = jsonDecode(body);
+  } catch (_) {
+    return const [];
+  }
+  final rawList = _asMap(decoded)['searchList'];
+  if (rawList is! List) return const [];
+  return _itemsFromHongguoSearchRows(rawList);
+}
+
 /// 红果镜像：与红果共用 hongguoduanju.com 网页端，分类与卡片取自
 /// 分类页，详情取自详情页的 router 数据，播放走备用接口加 360p 直链，
 /// 再以原始播放流程的播放源形状交回播放页，不另起播放器。
@@ -438,7 +497,12 @@ class HgtvMirrorContentClient implements DramaSiteContentClient {
     if (rawList is List) {
       for (var i = 0; i < rawList.length; i++) {
         final videoId = _stringOf(rawList[i]);
-        if (!RegExp(r'^\d+$').hasMatch(videoId) || seen.contains(videoId)) {
+        // 站方 2026-11 前后把 vid 从纯数字 id 换成 v1_ 开头的不透明
+        // 令牌（实测 2026-11-28：vid_list 形如 v1_OrVn8y1MeME…，
+        // 仍可作 fallback-play-info 的 item_id 取流）。旧口径只认
+        // 纯数字会把整表分集滤空、详情直接报「未返回有效分集」，
+        // 改为认数字 id 与令牌两种形态，字符集与长度仍设限防杂质。
+        if (!_isHongguoVid(videoId) || seen.contains(videoId)) {
           continue;
         }
         seen.add(videoId);
@@ -555,13 +619,19 @@ class HgtvMirrorContentClient implements DramaSiteContentClient {
           return DramaPlaySource(
             url: mainUrl,
             variants: [
-              DramaPlayVariant(name: '360P', url: direct360, height: 360),
+              // 360p 公开直链只对旧数字 vid 存在；v1_ 令牌 vid 实测
+              // 404（2026-11-28），不把死链摆成可选线路。
+              if (RegExp(r'^\d+$').hasMatch(episode.videoId))
+                DramaPlayVariant(name: '360P', url: direct360, height: 360),
             ],
           );
         }
       }
     } catch (_) {}
-    return DramaPlaySource(url: direct360);
+    if (RegExp(r'^\d+$').hasMatch(episode.videoId)) {
+      return DramaPlaySource(url: direct360);
+    }
+    throw StateError('红果播放地址获取失败，请稍后重试');
   }
 
   static const userAgent =
@@ -582,40 +652,25 @@ class HgtvMirrorContentClient implements DramaSiteContentClient {
     if (page.isEmpty) return const [];
     final rawList = page['searchList'];
     if (rawList is! List) return const [];
-    final seen = <String>{};
-    final items = <DramaSiteItem>[];
-    for (final raw in rawList) {
-      var node = _asMap(raw);
-      final video = _asMap(node['video_data']);
-      if (video.isNotEmpty) node = video;
-      final id = _stringOf(
-        node['series_id_str'] ?? node['series_id'] ?? node['keyword'],
-      );
-      if (!RegExp(r'^\d+$').hasMatch(id) || seen.contains(id)) continue;
-      final title = _stringOf(
-        node['series_title'] ?? node['series_name'] ?? node['title'] ?? node['name'],
-      );
-      if (title.isEmpty) continue;
-      var remark = _stringOf(node['episode_right_text']);
-      if (remark.isEmpty) {
-        final count = _stringOf(node['episode_cnt']);
-        if (count.isNotEmpty) remark = '共$count集';
-      }
-      seen.add(id);
-      items.add(
-        DramaSiteItem(
-          id: id,
-          title: title,
-          cover: _stringOf(node['series_cover'] ?? node['cover']),
-          remark: remark,
-        ),
-      );
-    }
-    return items;
+    return _itemsFromHongguoSearchRows(rawList);
   }
 
   @override
   Future<List<DramaSiteItem>> search(String query) async {
+    // 搜索页已改成纯前端壳、SSR 不再带 searchList（2026-11-28 实测
+    // 回空），结果改走同站 JSON 接口；接口拿不到才回旧页面路兜底。
+    try {
+      final response = await _client.get(
+        Uri.parse(
+          '$baseUrl/api/search/result?query=${Uri.encodeQueryComponent(query)}',
+        ),
+        headers: {'Referer': '$baseUrl/', 'User-Agent': userAgent},
+      );
+      if (response.statusCode == 200) {
+        final items = parseHongguoSearchApi(response.body);
+        if (items.isNotEmpty) return items;
+      }
+    } catch (_) {}
     final response = await _client.get(
       Uri.parse('$baseUrl/search/${Uri.encodeComponent(query)}'),
       headers: {'Referer': '$baseUrl/', 'User-Agent': userAgent},
@@ -1222,13 +1277,21 @@ class HongguoContentClient implements DramaSiteContentClient {
           return DramaPlaySource(
             url: mainUrl,
             variants: [
-              DramaPlayVariant(name: '360P', url: direct360, height: 360),
+              // 360p 公开直链只对旧数字 vid 存在；v1_ 令牌 vid 实测
+              // 404（2026-11-28），不把死链摆成可选线路。
+              if (RegExp(r'^\d+$').hasMatch(episode.videoId))
+                DramaPlayVariant(name: '360P', url: direct360, height: 360),
             ],
           );
         }
       }
     } catch (_) {}
-    return DramaPlaySource(url: direct360);
+    // 最后一档兜底只对旧数字 vid 有意义（令牌 vid 的公开直链已 404）；
+    // 两路都拿不到时如实报错，不拿死链冒充播放源让播放器空转。
+    if (RegExp(r'^\d+$').hasMatch(episode.videoId)) {
+      return DramaPlaySource(url: direct360);
+    }
+    throw StateError('红果播放地址获取失败，请稍后重试');
   }
 
   static List<DramaSiteItem> parseSearch(String body) {
@@ -1246,40 +1309,28 @@ class HongguoContentClient implements DramaSiteContentClient {
     if (page.isEmpty) return const [];
     final rawList = page['searchList'];
     if (rawList is! List) return const [];
-    final seen = <String>{};
-    final items = <DramaSiteItem>[];
-    for (final raw in rawList) {
-      var node = _asMap(raw);
-      final video = _asMap(node['video_data']);
-      if (video.isNotEmpty) node = video;
-      final id = _stringOf(
-        node['series_id_str'] ?? node['series_id'] ?? node['keyword'],
-      );
-      if (!RegExp(r'^\d+$').hasMatch(id) || seen.contains(id)) continue;
-      final title = _stringOf(
-        node['series_title'] ?? node['series_name'] ?? node['title'] ?? node['name'],
-      );
-      if (title.isEmpty) continue;
-      var remark = _stringOf(node['episode_right_text']);
-      if (remark.isEmpty) {
-        final count = _stringOf(node['episode_cnt']);
-        if (count.isNotEmpty) remark = '共$count集';
-      }
-      seen.add(id);
-      items.add(
-        DramaSiteItem(
-          id: id,
-          title: title,
-          cover: _stringOf(node['series_cover'] ?? node['cover']),
-          remark: remark,
-        ),
-      );
-    }
-    return items;
+    return _itemsFromHongguoSearchRows(rawList);
   }
 
   @override
   Future<List<DramaSiteItem>> search(String query) async {
+    // 搜索页已改成纯前端壳、SSR 不再带 searchList（2026-11-28 实测
+    // 回空），结果改走同站 JSON 接口；接口拿不到才回旧页面路兜底。
+    try {
+      final response = await _client.get(
+        Uri.parse(
+          '$baseUrl/api/search/result?query=${Uri.encodeQueryComponent(query)}',
+        ),
+        headers: {
+          'Referer': '$baseUrl/',
+          'User-Agent': HgtvMirrorContentClient.userAgent,
+        },
+      );
+      if (response.statusCode == 200) {
+        final items = parseHongguoSearchApi(response.body);
+        if (items.isNotEmpty) return items;
+      }
+    } catch (_) {}
     final response = await _client.get(
       Uri.parse('$baseUrl/search/${Uri.encodeComponent(query)}'),
       headers: {

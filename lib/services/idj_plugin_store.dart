@@ -7,6 +7,8 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'net_resilience.dart';
+
 /// iDuanJu `.idjplugin` 插件仓库（修仙版）：manifest 校验 + 包解析 /
 /// 下载 / 完整性 / 试加载 / 写盘 / 索引 / 订阅 / 更新检查 + 已装索引。
 ///
@@ -1379,7 +1381,32 @@ class IdjPluginStore {
     }
   }
 
+  /// 下载入口：先直连；若地址在 raw.githubusercontent.com 上且败于
+  /// 网络层（连不上 / 解析不了 / 超时），且 GitHub 镜像回退开关开着，
+  /// 自动改写成 jsDelivr 镜像地址重拉一次（见 net_resilience.dart）。
+  /// HTTP 状态错误是对方的真答复，不回退。
   Future<List<int>> _downloadBytes(Uri uri, {required int maxBytes}) async {
+    try {
+      return await _downloadBytesOnce(uri, maxBytes: maxBytes);
+    } on IdjPluginFailure catch (failure) {
+      final mirror =
+          NetResiliencePreferences.instance.githubMirrorEnabled.value
+          ? GithubMirror.jsDelivrUri(uri)
+          : null;
+      if (mirror == null || !_isNetworkLayerFailure(failure)) rethrow;
+      debugPrint('idj 下载改走 jsDelivr 镜像：$uri → $mirror');
+      return _downloadBytesOnce(mirror, maxBytes: maxBytes);
+    }
+  }
+
+  static bool _isNetworkLayerFailure(IdjPluginFailure failure) {
+    final message = failure.message;
+    return message.contains('网络连接不通') ||
+        message.contains('域名无法解析') ||
+        message.contains('下载超时');
+  }
+
+  Future<List<int>> _downloadBytesOnce(Uri uri, {required int maxBytes}) async {
     var current = uri;
     final client = (_httpClientFactory ?? HttpClient.new)();
     client.connectionTimeout = const Duration(seconds: 20);
@@ -1469,7 +1496,17 @@ class IdjPluginStore {
     try {
       addresses = await InternetAddress.lookup(host);
     } catch (_) {
-      throw IdjPluginFailure('下载失败：域名无法解析');
+      // 系统 DNS 解析失败：DoH 开着时用加密 DNS 的结果继续做同样的
+      // 内网校验（校验口径不变，只是换个解析来源）；DoH 也失败才报错。
+      if (NetResiliencePreferences.instance.dohEnabled.value) {
+        try {
+          addresses = await DohResolver.resolve(host);
+        } catch (_) {
+          throw IdjPluginFailure('下载失败：域名无法解析');
+        }
+      } else {
+        throw IdjPluginFailure('下载失败：域名无法解析');
+      }
     }
     for (final address in addresses) {
       if (_isPrivateOrLoopback(address)) {

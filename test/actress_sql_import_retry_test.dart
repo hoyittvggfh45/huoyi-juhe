@@ -120,7 +120,6 @@ void main() {
     final livePath = '${tempDir.path}/live.db';
     await File(livePath).writeAsString('OLDDB');
     final importer = ActressSqlImporter(
-      versionGate: (_) async => null,
       executorFactory: factoryFor(executor),
     );
     final result = await importer.importFile(
@@ -157,7 +156,6 @@ void main() {
     final livePath = '${tempDir.path}/live.db';
     await File(livePath).writeAsString('OLDDB');
     final importer = ActressSqlImporter(
-      versionGate: (_) async => null,
       executorFactory: factoryFor(executor),
     );
     final result = await importer.importFile(
@@ -192,7 +190,6 @@ void main() {
     final livePath = '${tempDir.path}/live.db';
     await File(livePath).writeAsString('OLDDB');
     final importer = ActressSqlImporter(
-      versionGate: (_) async => null,
       batchSize: 1000,
       batchByteLimit: 512,
       executorFactory: factoryFor(executor),

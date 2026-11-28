@@ -17,12 +17,14 @@ import 'sql_text_stream.dart';
 /// 合并文件（bundle）分段导入器（2026-11-27 站点库续办批）：
 /// 一份「凡人修仙站点.sql」装三段（site/actress/magnet），格式
 /// 见 SEGMENT_SPEC.md 段格式规格 v1。导入算法照规格 §5：
-/// 流式执行整文件进 staging 临时库 → 验整文件签名与整库
-/// 版本门（不过全拒；版本门只留这一道，2026-11-28 设计令）
+/// 流式执行整文件进 staging 临时库 → 验整文件签名与清单
+/// （不过全拒；数据库版本门已全拆，2026-11-28 用户令，
+/// format_version 等版本字段只随清单留痕、不作比对）
 /// → 逐段完整性校验（计数/payload/签名/代码哈希，坏段定位
-/// 到段、但整库一体：一段不过整库不导）→ 逐段落位（site 剥
-/// 前缀建段 .db 交女优库导入链；magnet 剥前缀建段 .db 交磁力
-/// 并存合并链）。旧无前缀单段文件不走这里（服务层粗扫不到
+/// 到段、但整库一体：一段不过整库不导）→ 逐段落位（actress
+/// 剥前缀建段 .db 交女优库导入链；magnet 剥前缀建段 .db 交
+/// 磁力并存合并链；site 段不落位、报「已跳过：站点已内置于
+/// 软件」）。旧无前缀单段文件不走这里（服务层粗扫不到
 /// bundle_manifest 字样时直接走现行单段路；粗扫误报时本类
 /// staging 后查无 bundle_manifest 表、回 null 交回单段路）。
 ///
@@ -277,8 +279,9 @@ typedef SiteLibraryMagnetLander =
     );
 
 /// 生产演员库段落位：走女优库既有 .db 导入链（结构校验→先验
-/// 后换进导入槽）；版本门已在段校验层过（段 manifest 的版本
-/// 字段），段 .db 自带 schema_meta、组装激活批后其链内门也认。
+/// 后换进导入槽）。版本字段全程不设门（2026-11-28 版本门全
+/// 拆）：段 manifest 与段 .db 自带的 schema_meta 版本字段只
+/// 随记录留痕，段校验层与 .db 导入链都只做结构/完整性校验。
 Future<({bool ok, String? error, String? detail})>
 productionActressSegmentLander(String segmentDbPath) async {
   final outcome = await ActressDbImportService().importLocalFile(
@@ -417,8 +420,6 @@ class SiteLibraryBundleImporter {
   SiteLibraryBundleImporter({
     this.batchSize = 1000,
     this.batchByteLimit = 512 * 1024,
-    this.currentCoreVersion = siteLibraryDefaultCoreVersion,
-    this.supportedFormatVersion = siteLibrarySupportedFormatVersion,
     Future<SiteLibrarySqlExecutor> Function(String tempPath)?
     executorFactory,
     SiteLibrarySegmentMaterializer? materializer,
@@ -450,10 +451,6 @@ class SiteLibraryBundleImporter {
   /// 上限把单批载荷封顶。
   final int batchByteLimit;
 
-  /// 兼容保留字段：2026-11-28 取消核心门后不再参与任何比对
-  /// （旧调用点传值无害），见 importFile 整库门注释。
-  final String currentCoreVersion;
-  final String supportedFormatVersion;
   final Future<SiteLibrarySqlExecutor> Function(String tempPath)
   _executorFactory;
   final SiteLibrarySegmentMaterializer _materializer;
@@ -504,7 +501,7 @@ class SiteLibraryBundleImporter {
   }
 
   /// 导入合并文件。不是合并文件（staging 后无 bundle_manifest
-  /// 表）回 null，调用方走单段路。整文件层失败（签名/版本门）
+  /// 表）回 null，调用方走单段路。整文件层失败（清单/签名）
   /// 回 ok=false 的结果、任何段都不落位；段层失败只进该段的
   /// segmentResults。
   Future<SiteLibraryImportOutcome?> importBundle({
@@ -565,12 +562,13 @@ class SiteLibraryBundleImporter {
         ),
       );
 
-      _stage = '整文件校验（清单/签名/版本门）';
-      // ---- 整文件层：清单/格式/整签/整文件版本门，不过全拒 ----
-      // 版本门只留这一道整库的（2026-11-28 用户设计令：站点
-      // 不再单独成库、单独设门，导入激活整份数据库时三段
-      // 一并激活）；段层只做完整性校验（计数/payload/签名/
-      // 代码哈希），坏在哪段报哪段，但不再逐段版本拒收。
+      _stage = '整文件校验（清单/签名）';
+      // ---- 整文件层：清单/格式/整签，不过全拒 ----
+      // 数据库版本门已全拆（2026-11-28 用户令）：整文件与
+      // 段层的 format_version/core_version 等版本字段只随
+      // 清单留痕、不作任何比对；整文件层只剩清单形态＋整
+      // payload＋整签名校验，段层只做完整性校验（计数/
+      // payload/签名/代码哈希），坏在哪段报哪段。
       final bundleRows = await executor.query(
         'SELECT bundle_format, format_version, core_version, '
         'bundle_version, segments, payload_sha256, signature '
@@ -589,7 +587,6 @@ class SiteLibraryBundleImporter {
           error: '合并文件清单不对（不是凡人修仙合并文件），已整份拒收',
         );
       }
-      final bundleFormatVersion = '${bundle['format_version'] ?? ''}';
       final bundleVersion = '${bundle['bundle_version'] ?? ''}';
       final segmentNames = '${bundle['segments'] ?? ''}'
           .split(',')
@@ -661,16 +658,10 @@ class SiteLibraryBundleImporter {
           error: '整文件签名不对，已整份拒收',
         );
       }
-      if (bundleFormatVersion != supportedFormatVersion) {
-        return SiteLibraryImportOutcome(
-          ok: false,
-          error: '合并文件格式版本 $bundleFormatVersion 与当前软件支持的 '
-              '$supportedFormatVersion 不符，已整份拒收',
-        );
-      }
-      // 核心版本不再设门（2026-11-28 13:25 用户令「取消这
-      // 个」）：bundle_manifest.core_version 带什么值都不拒，
-      // 只随清单留痕；整库门只剩格式版本＋签名/哈希完整性。
+      // 版本字段不设门（2026-11-28 用户令：数据库版本彻底
+      // 取消）：bundle_manifest 的 format_version/core_version
+      // 带什么值、缺不缺，都不拒收，只随清单留痕；整文件层
+      // 只剩清单形态＋payload/签名完整性校验。
 
       // ---- 逐段完整性校验：坏段定位到段，但整库一体 ----
       // 一份数据库、一次激活：任何一段完整性不过，整库不
@@ -720,11 +711,13 @@ class SiteLibraryBundleImporter {
         );
       }
 
-      // ---- 逐段落位（site → actress → magnet 固定序） ----
+      // ---- 逐段落位（actress → magnet；site 段跳过） ----
+      // 站点已回包内置（2026-11-28 用户令：取消整套激活方案、
+      // 内置站点直接显示）：site 段只做完整性校验、不再落位
+      // 站点库，段结果报「已跳过」；actress/magnet 两段照常
+      // 落位。
       await executor.close();
       executor = null;
-      var stationCount = 0;
-      String? siteLibraryVersion;
       for (final seg in _knownSegments) {
         final plan = verified[seg];
         if (plan == null) continue;
@@ -740,22 +733,23 @@ class SiteLibraryBundleImporter {
             totalBytes: await sqlFile.length(),
           ),
         );
-        final result = await _landSegment(
-          stagingPath: stagingPath,
-          siteDbPath: siteDbPath,
-          workDir: workDir,
-          plan: plan,
-        );
+        final result = seg == 'site'
+            ? const SiteLibrarySegmentResult(
+                segment: 'site',
+                ok: true,
+                detail: '已跳过：站点已内置于软件',
+              )
+            : await _landSegment(
+                stagingPath: stagingPath,
+                workDir: workDir,
+                plan: plan,
+              );
         results[seg] = result;
         if (!result.ok) {
           await ImportDebugLog.record(
             stage: _stage,
             error: result.error ?? '落位失败',
           );
-        }
-        if (seg == 'site' && result.ok) {
-          stationCount = _siteStationCounts[plan.payloadSha256] ?? 0;
-          siteLibraryVersion = plan.libraryVersion;
         }
       }
       final ordered = [
@@ -775,8 +769,7 @@ class SiteLibraryBundleImporter {
       }
       return SiteLibraryImportOutcome(
         ok: true,
-        stationCount: stationCount,
-        libraryVersion: siteLibraryVersion ?? bundleVersion,
+        libraryVersion: bundleVersion,
         segmentResults: ordered,
       );
     } on SiteLibraryImportCancelled {
@@ -799,9 +792,6 @@ class SiteLibraryBundleImporter {
       } catch (_) {}
     }
   }
-
-  /// site 段落位成功时的站数（按 payload 索引，_landSegment 写）。
-  final _siteStationCounts = <String, int>{};
 
   Future<bool> _tableExists(
     SiteLibrarySqlExecutor executor,
@@ -834,7 +824,7 @@ class SiteLibraryBundleImporter {
 
   /// 逐段完整性：行数对账 → payload 重算 → 签名（站点段另
   /// 含代码逐行哈希）。过关回 null，不过回中文拒因（写明
-  /// 段名）。版本门不在段层（只留整库一道，见文件头）。
+  /// 段名）。版本字段在段层只作记录、不设门（见文件头）。
   Future<String?> _verifySegment(
     SiteLibrarySqlExecutor executor,
     _SegmentPlan plan,
@@ -881,11 +871,6 @@ class SiteLibraryBundleImporter {
         }
         if (codeRows.length < 200) break;
       }
-      final stationRows = await executor.query(
-        'SELECT COUNT(*) AS c FROM seg_site_stations',
-      );
-      _siteStationCounts[plan.payloadSha256] =
-          (stationRows.first['c'] as num?)?.toInt() ?? 0;
     } else {
       payload = await computeBundleSegmentPayload(
         executor,
@@ -900,9 +885,9 @@ class SiteLibraryBundleImporter {
         plan.signature != computeSiteLibrarySignature(payload)) {
       return '$label段签名不对，已拒收这一段';
     }
-    // 段清单里的 format_version/core_version 只作记录，不再
-    // 单独设门（2026-11-28 用户设计令：版本门只留整库一道，
-    // 在整文件层已验；站点不再单独成库单独激活）。
+    // 段清单里的 format_version/core_version 只作记录，不
+    // 参与任何判定（2026-11-28 用户令：数据库版本门全拆，
+    // 整文件层同样不比对版本字段）。
     return null;
   }
 
@@ -946,76 +931,17 @@ class SiteLibraryBundleImporter {
     );
   }
 
-  /// 一段落位。site：物化→补 manifest 表→先验后换；actress/
-  /// magnet：物化→补索引→交各自落位链。失败回该段的拒因，
-  /// 已落位的别段不回滚（各段独立、与规格口径一致）。
+  /// 一段落位（actress/magnet；site 段不走这里，落位已取消、
+  /// 在 importBundle 里直接报「已跳过」）。物化→补索引→交
+  /// 各自落位链。失败回该段的拒因，已落位的别段不回滚（各
+  /// 段独立、与规格口径一致）。
   Future<SiteLibrarySegmentResult> _landSegment({
     required String stagingPath,
-    required String siteDbPath,
     required String workDir,
     required _SegmentPlan plan,
   }) async {
     final seg = plan.segment;
     try {
-      if (seg == 'site') {
-        final tempPath = '$siteDbPath.importing';
-        await _materializer.materialize(
-          stagingPath: stagingPath,
-          segment: seg,
-          targetPath: tempPath,
-        );
-        // 补旧单段格式的 manifest 表（服务层 load() 读它判版本）。
-        final executor = await _executorFactory(tempPath);
-        try {
-          await executor.execute(
-            'CREATE TABLE manifest('
-            'id INTEGER PRIMARY KEY CHECK(id=1), '
-            'library_version TEXT NOT NULL, '
-            'station_count INTEGER NOT NULL, '
-            'payload_sha256 TEXT NOT NULL, signature TEXT, '
-            'format_version TEXT NOT NULL, core_version TEXT NOT NULL)',
-          );
-          final count = _siteStationCounts[plan.payloadSha256] ?? 0;
-          await executor.execute(
-            'INSERT INTO manifest VALUES(1, '
-            "'${_sqlText(plan.libraryVersion)}', $count, "
-            "'${_sqlText(plan.payloadSha256)}', "
-            "'${_sqlText(plan.signature)}', "
-            "'${_sqlText(plan.formatVersion)}', "
-            "'${_sqlText(plan.coreVersion)}')",
-          );
-        } finally {
-          await executor.close();
-        }
-        // 先验后换（与单段路同款）：旧库拷 .bak → 临时库改名。
-        final liveFile = File(siteDbPath);
-        final bakPath = '$siteDbPath.bak';
-        final liveExists = await liveFile.exists();
-        if (liveExists) await liveFile.copy(bakPath);
-        try {
-          await File(tempPath).rename(siteDbPath);
-        } catch (e) {
-          if (!await liveFile.exists() && liveExists) {
-            try {
-              await File(bakPath).copy(siteDbPath);
-            } catch (_) {}
-          }
-          try {
-            await File(tempPath).delete();
-          } catch (_) {}
-          return SiteLibrarySegmentResult(
-            segment: seg,
-            ok: false,
-            error: '站点库段换库失败：$e（已恢复原库）',
-          );
-        }
-        final count = _siteStationCounts[plan.payloadSha256] ?? 0;
-        return SiteLibrarySegmentResult(
-          segment: seg,
-          ok: true,
-          detail: '$count 个站',
-        );
-      }
       final segmentDbPath = '$workDir/segment_$seg.db';
       await _materializer.materialize(
         stagingPath: stagingPath,
@@ -1047,8 +973,6 @@ class SiteLibraryBundleImporter {
       );
     }
   }
-
-  static String _sqlText(String value) => value.replaceAll("'", "''");
 
   /// 流式执行整文件进 staging（与单段导入器同款分批/过滤口径：
   /// BEGIN/COMMIT 跳过、统计语句过滤、INSERT 攒批）。

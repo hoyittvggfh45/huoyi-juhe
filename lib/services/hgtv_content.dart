@@ -6,14 +6,11 @@ import 'package:http/http.dart' as http;
 import 'drama_playback.dart';
 import 'drama_site_content.dart';
 import 'drama_sites.dart';
+import 'hongguo_identity.dart';
 import 'hongguo_sign.dart';
 
 const String _hgtvAppBase = 'https://api5-normal-sinfonlineb.fqnovel.com';
 const String _hgtvWebBase = 'https://hongguoduanju.com';
-const String _hgtvAppUserAgent =
-    'com.phoenix.read/74332 (Linux; U; Android 16; zh_CN; 25053RT47C; '
-    'Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 '
-    'QuicVersion:c67e9834 2025-09-08)';
 
 String _goQueryEscape(String value) {
   final bytes = utf8.encode(value);
@@ -264,46 +261,79 @@ String _hgtvDeviceId(Random random) {
 
 class HgtvContentClient implements DramaSiteContentClient {
   final http.Client _client;
-  late final String _deviceId;
-  late final String _installId;
 
-  HgtvContentClient([http.Client? client, Random? random])
-    : _client = client ?? http.Client() {
-    final source = random ?? Random();
-    _deviceId = _hgtvDeviceId(source);
-    _installId = _hgtvDeviceId(source);
+  /// 本客户端定格的匿名身份：构造时定格，整个生命周期不变——
+  /// 同一轮里目录/详情/搜索与签名用的 device_id 完全一致，
+  /// 轮换只发生在下一次构造（见 hongguo_identity.dart）。
+  late final HongguoAnonIdentity _identity;
+
+  /// 身份由轮换服务供给时才挂被拒标记；外部注入固定身份或旧
+  /// 随机路（测试）时为 null，被拒不回写。
+  final HongguoIdentityService? _identityService;
+
+  /// 优先次序：注入身份 > 注入服务快照 > 传入 Random 的旧随机
+  /// 路（仅存量测试在用）> 全局轮换服务快照。
+  HgtvContentClient([
+    http.Client? client,
+    Random? random,
+    HongguoAnonIdentity? identity,
+    HongguoIdentityService? identityService,
+  ]) : _client = client ?? http.Client(),
+       _identityService = identity != null
+           ? null
+           : (identityService ??
+                 (random == null ? HongguoIdentityService.shared : null)) {
+    if (identity != null) {
+      _identity = identity;
+    } else if (identityService != null) {
+      _identity = identityService.snapshot();
+    } else if (random != null) {
+      _identity = HongguoAnonIdentity(
+        deviceId: _hgtvDeviceId(random),
+        installId: _hgtvDeviceId(random),
+        dateStamp: HongguoIdentityService.dateStampOf(DateTime.now()),
+        ipStamp: HongguoIdentityService.unknownIp,
+        generation: 0,
+      );
+    } else {
+      _identity = HongguoIdentityService.shared.snapshot();
+    }
   }
 
+  /// 本客户端定格的身份（供页面/测试核对，播放链不回头换）。
+  HongguoAnonIdentity get identity => _identity;
+
   Map<String, String> _appQuery() {
+    final profile = _identity.profile;
     return {
       'aid': '8662',
       'app_name': 'novelread',
-      'version_code': '74332',
-      'version_name': '7.4.3.32',
-      'manifest_version_code': '74332',
-      'update_version_code': '74332',
-      'channel': 'update_64',
+      'version_code': profile.versionCode,
+      'version_name': profile.versionName,
+      'manifest_version_code': profile.versionCode,
+      'update_version_code': profile.versionCode,
+      'channel': profile.channel,
       'device_platform': 'android',
       'os': 'android',
       'ssmix': 'a',
-      'device_type': '25053RT47C',
-      'device_brand': 'Redmi',
+      'device_type': profile.model,
+      'device_brand': profile.brand,
       'language': 'zh',
-      'os_api': '36',
-      'os_version': '16',
-      'resolution': '1280*2772',
-      'dpi': '520',
+      'os_api': profile.osApi,
+      'os_version': profile.osVersion,
+      'resolution': profile.resolution,
+      'dpi': profile.dpi,
       'ac': 'wifi',
-      'device_id': _deviceId,
-      'iid': _installId,
+      'device_id': _identity.deviceId,
+      'iid': _identity.installId,
       'host_abi': 'arm64-v8a',
       'dragon_device_type': 'phone',
-      'pv_player': '74332',
+      'pv_player': profile.versionCode,
       'compliance_status': '0',
       'need_personal_recommend': '1',
       'player_so_load': '1',
       'is_android_pad_screen': '0',
-      'cdid': _deviceId,
+      'cdid': _identity.cdid,
     };
   }
 
@@ -313,6 +343,10 @@ class HgtvContentClient implements DramaSiteContentClient {
   ) async {
     final body = utf8.encode(jsonEncode(payload));
     Object? lastError;
+    // 服务端对「不够格的身份」是静默回空：200 但 body 为空。
+    // 两次重试都回空 = 这套身份被拒，标记给下一次构造轮换；
+    // 纯网络异常（超时/断连）不算被拒，不标记。
+    var sawEmptyBody = false;
     for (var attempt = 0; attempt < 2; attempt++) {
       final now = DateTime.now();
       final query = _appQuery()
@@ -325,7 +359,7 @@ class HgtvContentClient implements DramaSiteContentClient {
         now: now,
         rawQuery: queryString,
       );
-      headers['User-Agent'] = _hgtvAppUserAgent;
+      headers['User-Agent'] = _identity.profile.userAgent;
       headers['Accept'] = 'application/json';
       headers['X-XS-From-Web'] = '0';
       headers['Sdk-Version'] = '2';
@@ -350,6 +384,7 @@ class HgtvContentClient implements DramaSiteContentClient {
       }
       final text = utf8.decode(response.bodyBytes);
       if (text.isEmpty) {
+        sawEmptyBody = true;
         lastError = StateError('红果 App 接口未返回有效数据');
         continue;
       }
@@ -362,14 +397,23 @@ class HgtvContentClient implements DramaSiteContentClient {
         final baseResp = _asMap(decoded['BaseResp']);
         final alt = _anyString(baseResp['StatusCode']);
         if (alt.isNotEmpty && alt != '0') {
+          await _markIdentityRejected();
           throw StateError('红果 App 接口暂不可用（$alt）');
         }
       } else if (code != '0') {
+        await _markIdentityRejected();
         throw StateError('红果 App 接口暂不可用（$code）');
       }
       return decoded;
     }
+    if (sawEmptyBody) await _markIdentityRejected();
     throw lastError ?? StateError('红果 App 接口未返回有效数据');
+  }
+
+  /// 身份被拒只置标记，本客户端这一轮照旧失败收尾——不在请求
+  /// 链中途换身份（同轮一致），换新发生在下一次构造的校验里。
+  Future<void> _markIdentityRejected() async {
+    await _identityService?.markRejected();
   }
 
   Future<HgtvLandpage> _landpage(

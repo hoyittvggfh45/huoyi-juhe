@@ -22,10 +22,16 @@ import '../../services/shell_proxy_url.dart';
 /// 是站客户端的取流，短剧区默认的番茄接口不走这里）。
 ///
 /// 顶栏（返回 / MPV 徽标 / 方向 / 一起看 / 全屏）与底部控制行（倍速 /
-/// 画质 / 投屏 / 选集 / 画中画 / 全屏）照目标截图摆；投屏与一起看在修仙版
-/// 还没接通，点按只给一句实话，不留静默死入口。播放器后端是原生
+/// 画质 / 选集 / 画中画 / 全屏）照目标截图摆；一起看在修仙版还没接通，
+/// 点按只给一句实话，不留静默死入口。播放器后端是原生
 /// ExoPlayer（MPV 徽标只是照火蚁TV的版式画的标签，引擎没换——第 14 轮
 /// 撤 libmpv 时云端门禁要求 Android 保留 ExoPlayer）。
+///
+/// 2026-11-28 控件九项修法（用户实测火蚁内嵌播放后点名、凡人照单全
+/// 收，只动内嵌控件层、全屏控件不动）：返回键与核心徽标缩小、顶栏贴
+/// 画面最上边、控件层（顶栏/中央/底栏）整层一起隐一起显、投屏钮整
+/// 个删除、触控钮去掉圆形/胶囊深色底板、画中画接通本应用既有的悬浮
+/// 窗服务（点钮即把画面搬进悬浮小窗；需悬浮窗权限，无权限给实话）。
 class FilmInlinePlayer extends StatefulWidget {
   const FilmInlinePlayer({
     super.key,
@@ -74,7 +80,8 @@ class FilmInlinePlayer extends StatefulWidget {
   State<FilmInlinePlayer> createState() => FilmInlinePlayerState();
 }
 
-class FilmInlinePlayerState extends State<FilmInlinePlayer> {
+class FilmInlinePlayerState extends State<FilmInlinePlayer>
+    with WidgetsBindingObserver {
   static const _speedSteps = <double>[1.0, 1.25, 1.5, 2.0, 0.5];
 
   late final InlineVideoPlayback _session;
@@ -83,6 +90,10 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
   bool _controlsVisible = true;
   Timer? _hideTimer;
   int _generation = 0;
+
+  /// 画中画（悬浮窗）所有者 id：点画中画钮接通后非空；回前台、切集、
+  /// 进全屏、控件销毁时都要收掉，避免小窗占着已被换掉的播放器。
+  int? _pipOwner;
 
   /// 拖动预览位置（毫秒，拖进度条或横滑画面时非空）：这段时间里进度
   /// 条与时间文字都以它为准，会话的位置回声（seek 落地前还是旧位置）
@@ -99,6 +110,7 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _session = InlineVideoPlayback(
       contentLoader: widget.contentLoader,
       directoryLoader: (id, tab) async => [widget.episodes],
@@ -110,10 +122,96 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
   @override
   void dispose() {
     _generation++;
+    WidgetsBinding.instance.removeObserver(this);
     _hideTimer?.cancel();
+    final pipOwner = _pipOwner;
+    _pipOwner = null;
+    if (pipOwner != null) unawaited(NativePlayer.stopFloating(pipOwner));
     _session.playing.removeListener(_onPlayingChanged);
     unawaited(_session.dispose());
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 悬浮小窗在桌面/其他应用上层播；用户回到本应用就收窗回内嵌面
+    // （与整页播放器 _stopFloating 的回程口径一致）。
+    if (state == AppLifecycleState.resumed && _pipOwner != null) {
+      unawaited(_stopPip());
+    }
+  }
+
+  /// 收掉画中画悬浮窗（若开着）。原生侧按 owner 退休，迟到的停窗
+  /// 不会误伤别的所有者。
+  Future<void> _stopPip() async {
+    final owner = _pipOwner;
+    _pipOwner = null;
+    if (owner != null) await NativePlayer.stopFloating(owner);
+  }
+
+  /// 画中画：把当前会话播放器搬进系统悬浮小窗（本应用既有的悬浮窗
+  /// 服务，与整页播放器切后台小窗同一套）。要悬浮窗权限：没有就打开
+  /// 系统设置页并给一句实话，不假装已进小窗。
+  Future<void> _enterPip() async {
+    if (!_started || !_hasPlayer) {
+      _pipSnack('先开始播放，再用画中画');
+      return;
+    }
+    if (_pipOwner != null) {
+      _pipSnack('已经在画中画小窗里播放了');
+      return;
+    }
+    final player = _session.player;
+    final playerId = player?.playerId;
+    if (player == null || playerId == null) {
+      _pipSnack('播放器还没就绪，画中画用不了');
+      return;
+    }
+    try {
+      if (!await NativePlayer.canDrawOverlays()) {
+        await NativePlayer.requestOverlayPermission();
+        _pipSnack('画中画需要悬浮窗权限：在系统设置里允许后，再点一次画中画');
+        return;
+      }
+      final owner = await NativePlayer.allocateFloatingOwner();
+      final episode = widget.episodes.isEmpty
+          ? null
+          : widget.episodes[widget.episodeIndex.clamp(
+              0,
+              widget.episodes.length - 1,
+            )];
+      final size = _session.videoSize.value;
+      await NativePlayer.startFloating(
+        owner: owner,
+        playerId: playerId,
+        title: widget.title,
+        episode: episode?.title ?? '',
+        playing: _session.playing.value,
+        hasPrev: widget.episodeIndex > 0,
+        hasNext: widget.episodeIndex + 1 < widget.episodes.length,
+        positionMs: _session.position.value.inMilliseconds,
+        durationMs: _session.duration.value.inMilliseconds,
+        speed: _session.rate.value,
+        videoWidth: size.width.round(),
+        videoHeight: size.height.round(),
+      );
+      await NativePlayer.showFloating(owner);
+      if (!mounted) {
+        await NativePlayer.stopFloating(owner);
+        return;
+      }
+      _pipOwner = owner;
+      _showControlsTemporarily();
+    } catch (_) {
+      _pipSnack('画中画启动失败，这台设备可能不支持悬浮窗');
+    }
+  }
+
+  void _pipSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   void _onPlayingChanged() {
@@ -140,6 +238,8 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
   /// 从指定集起播（海报播放钮与选集格子都走这里）。
   Future<void> playEpisode(int index) async {
     if (widget.episodes.isEmpty) return;
+    // 切集会换播放器：悬浮小窗还占着旧播放器时先收窗。
+    await _stopPip();
     final target = index.clamp(0, widget.episodes.length - 1);
     final generation = ++_generation;
     setState(() {
@@ -293,6 +393,8 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
       widget.onFullscreen?.call();
       return;
     }
+    // 全屏要销毁内嵌这台播放器：悬浮小窗先收，免得占着已销毁的实例。
+    await _stopPip();
     // 整页播放器自己建一个原生实例：先把内联这台存档 + 销毁，
     // 不然两台 ExoPlayer 并存会抢解码器。
     await _session.disposePlayer();
@@ -444,9 +546,12 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
           _errorOverlay(error)
         else if (loading)
           _loadingOverlay(episode)
-        else if (!_started || !playing)
+        // 控件层整层同显同隐（九项修法第 2 项）：中央暂停钮不再自成
+        // 一层——未起播时它就是起播入口常驻；起播后跟顶栏/底栏共用
+        // 同一个 _controlsVisible，隐时一起隐、显时一起显。
+        else if (!_started || (!playing && _controlsVisible))
           _pausedOverlay(episode),
-        if (_controlsVisible || !_started || !playing) _topBar(),
+        if (_controlsVisible || !_started) _topBar(),
         if (_controlsVisible && _started && _hasPlayer && error == null)
           _bottomControls(),
       ],
@@ -586,6 +691,29 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
     );
   }
 
+  /// 内嵌控件层小触控口径（九项修法第 1/5/7/8/9 项）：按钮触控区
+  /// 36dp（IconButton 默认会撑到 48，这里用定尺盒子压住）、图标
+  /// 直接落在画面上不要底板。
+  Widget _barButton({
+    required Key key,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    required IconData icon,
+    double iconSize = 20,
+  }) {
+    return SizedBox.square(
+      dimension: 36,
+      child: IconButton(
+        key: key,
+        tooltip: tooltip,
+        onPressed: onPressed,
+        padding: EdgeInsets.zero,
+        iconSize: iconSize,
+        icon: Icon(icon, color: Colors.white),
+      ),
+    );
+  }
+
   Widget _topBar() {
     return Positioned(
       top: 0,
@@ -599,31 +727,27 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
             colors: [Colors.black54, Colors.transparent],
           ),
         ),
-        padding: const EdgeInsets.fromLTRB(4, 8, 8, 16),
+        // 第 8 项：顶栏贴画面最上边排布（上内边距 0）。
+        padding: const EdgeInsets.fromLTRB(2, 0, 4, 10),
         child: Row(
           children: [
-            IconButton(
+            _barButton(
               key: const ValueKey('film-inline-back'),
               tooltip: '返回',
               onPressed: widget.onBack,
-              icon: const Icon(
-                Icons.arrow_back_ios_new_rounded,
-                color: Colors.white,
-              ),
+              icon: Icons.arrow_back_ios_new_rounded,
+              iconSize: 19,
             ),
             const Spacer(),
             _coreBadge(),
-            const SizedBox(width: 4),
-            IconButton(
+            const SizedBox(width: 2),
+            _barButton(
               key: const ValueKey('film-inline-orientation'),
               tooltip: '方向控制',
               onPressed: _openOrientationMenu,
-              icon: const Icon(
-                Icons.screen_rotation_alt_rounded,
-                color: Colors.white,
-              ),
+              icon: Icons.screen_rotation_alt_rounded,
             ),
-            IconButton(
+            _barButton(
               key: const ValueKey('film-inline-watchroom'),
               tooltip: '推送到一起看',
               onPressed: () {
@@ -631,16 +755,14 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
                   const SnackBar(content: Text('一起看房间还没做好')),
                 );
               },
-              icon: const Icon(Icons.home_rounded, color: Colors.white),
+              icon: Icons.home_rounded,
             ),
-            IconButton(
+            _barButton(
               key: const ValueKey('film-inline-fullscreen-top'),
               tooltip: '全屏',
               onPressed: _openFullscreen,
-              icon: const Icon(
-                Icons.fullscreen_rounded,
-                color: Colors.white,
-              ),
+              icon: Icons.fullscreen_rounded,
+              iconSize: 21,
             ),
           ],
         ),
@@ -651,30 +773,29 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
   /// 播放器后端徽标：照火蚁TV的版式画成 MPV（用户点的图就是这个样子）。
   /// 底下真是原生 ExoPlayer——第 14 轮撤 libmpv 时云端门禁要求 Android
   /// 保留 ExoPlayer，引擎没换；点徽标只说明这一点，不切换后端。
+  /// 九项修法第 5/9 项：胶囊再缩小一档，且去掉深色底板与描边，字直接
+  /// 落在画面上（加一层轻投影保可读）。
   Widget _coreBadge() {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        key: const ValueKey('film-inline-core'),
+        borderRadius: BorderRadius.circular(10),
         onTap: () {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('当前播放器：原生 ExoPlayer')),
           );
         },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.45),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.25)),
-          ),
-          child: const Text(
+        child: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+          child: Text(
             'MPV',
             style: TextStyle(
               color: Colors.white,
-              fontSize: 12,
+              fontSize: 10.5,
               fontWeight: FontWeight.w700,
-              letterSpacing: 1,
+              letterSpacing: 0.8,
+              shadows: [Shadow(color: Color(0x99000000), blurRadius: 4)],
             ),
           ),
         ),
@@ -726,51 +847,26 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
                   tooltip: '画质',
                   onPressed: _pickQuality,
                 ),
-                const SizedBox(width: 4),
-                IconButton(
-                  key: const ValueKey('film-inline-cast'),
-                  tooltip: '投屏',
-                  onPressed: () {
-                    ScaffoldMessenger.of(
-                      context,
-                    ).showSnackBar(const SnackBar(content: Text('投屏还没接')));
-                  },
-                  icon: const Icon(
-                    Icons.cast_rounded,
-                    color: Colors.white,
-                  ),
-                ),
                 const Spacer(),
-                IconButton(
+                _barButton(
                   key: const ValueKey('film-inline-episodes'),
                   tooltip: '选集',
                   onPressed: widget.onOpenEpisodes,
-                  icon: const Icon(
-                    Icons.grid_view_rounded,
-                    color: Colors.white,
-                  ),
+                  icon: Icons.grid_view_rounded,
                 ),
-                IconButton(
+                _barButton(
                   key: const ValueKey('film-inline-pip'),
                   tooltip: '画中画',
-                  onPressed: () {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('切后台会自动小窗播放')),
-                    );
-                  },
-                  icon: const Icon(
-                    Icons.picture_in_picture_alt_rounded,
-                    color: Colors.white,
-                  ),
+                  onPressed: () => unawaited(_enterPip()),
+                  icon: Icons.picture_in_picture_alt_rounded,
+                  iconSize: 19,
                 ),
-                IconButton(
+                _barButton(
                   key: const ValueKey('film-inline-fullscreen'),
                   tooltip: '全屏',
                   onPressed: _openFullscreen,
-                  icon: const Icon(
-                    Icons.fullscreen_rounded,
-                    color: Colors.white,
-                  ),
+                  icon: Icons.fullscreen_rounded,
+                  iconSize: 21,
                 ),
               ],
             ),
@@ -833,6 +929,8 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
     return '自动';
   }
 
+  /// 文字钮（倍速/画质）：九项修法第 9 项——去掉胶囊深色底板与描边，
+  /// 文字直接落在画面上（轻投影保可读），只留涟漪反馈。
   Widget _pillButton({
     required Key key,
     required String label,
@@ -843,21 +941,17 @@ class FilmInlinePlayerState extends State<FilmInlinePlayer> {
       color: Colors.transparent,
       child: InkWell(
         key: key,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(10),
         onTap: onPressed,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.45),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.25)),
-          ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
           child: Text(
             label,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 12,
               fontWeight: FontWeight.w600,
+              shadows: [Shadow(color: Color(0x99000000), blurRadius: 4)],
             ),
           ),
         ),

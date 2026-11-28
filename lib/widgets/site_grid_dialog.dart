@@ -31,15 +31,33 @@ extension SiteGridZoneLabel on SiteGridZone {
   };
 }
 
-/// 区内分组：短剧 / 视频 / 午夜。按站自带的类型字段分，分不出的按
-/// 站表归属老实归类（调用方给），弹窗内不猜。
-enum SiteGridGroup { shortDrama, video, midnight }
+/// 区内分组：短剧 / 视频 / 午夜是老分组（短剧选择器与导入区仍用）；
+/// film 起的五组是内置站自动分类（2026-11-28 用户令「639 站点
+/// 列表分类」）：影视区的内置区按内容形态分类——非成人视频归
+/// 「影视」，成人影视按来源形态二级拆 Python / Jar / 书源 / 其他
+/// （分类规则在 services/site_category.dart，调用方组表时算好，
+/// 弹窗内不猜）。新组只在调用方给了条目时才出现，不影响老调用点。
+enum SiteGridGroup {
+  shortDrama,
+  video,
+  midnight,
+  film,
+  adultFilmPy,
+  adultFilmJar,
+  adultFilmBook,
+  adultFilmOther,
+}
 
 extension SiteGridGroupLabel on SiteGridGroup {
   String get label => switch (this) {
     SiteGridGroup.shortDrama => '短剧',
     SiteGridGroup.video => '视频',
     SiteGridGroup.midnight => '午夜',
+    SiteGridGroup.film => '影视',
+    SiteGridGroup.adultFilmPy => '成人影视 · Python 站',
+    SiteGridGroup.adultFilmJar => '成人影视 · Jar 站',
+    SiteGridGroup.adultFilmBook => '成人影视 · 书源站',
+    SiteGridGroup.adultFilmOther => '成人影视 · 其他',
   };
 }
 

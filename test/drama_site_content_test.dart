@@ -108,6 +108,72 @@ void main() {
     );
   });
 
+  test('红果详情解析：v1_ 令牌 vid 成选集，杂质条目滤掉', () {
+    // 2026-11-28 真网实测形态：vid_list 已换成 v1_ 令牌，且详情只带
+    // accessible_episode_cnt 条（此处 3 条）；旧口径只认纯数字会把
+    // 整表滤空、详情报「未返回有效分集」导致全站无法播放。
+    final detail = HgtvMirrorContentClient.parseDetail(
+      '<html><script>window._ROUTER_DATA = {"loaderData":{"detail_page":{"seriesDetail":{"series_id":"7710503618658454553","series_name":"温夜潮湿","series_cover":"https://example.test/cover.jpg","episode_cnt":78,"accessible_episode_cnt":3,"vid_list":["v1_OrVn8y1MeMEceiaS9W_vEwgRLqA","v1_pJI0GeMn7pTPZTxhN0yZHzstMLU","v1_OrVn8y1MeMEceiaS9W_vEwgRLqA","","https://evil.test/x","v1_qf7NIatSkW1hQU3k1Wam-0B-07U"]}}}};</script></html>',
+      '7710503618658454553',
+    );
+    expect(detail.title, '温夜潮湿');
+    expect(detail.episodes.map((e) => e.videoId).toList(), [
+      'v1_OrVn8y1MeMEceiaS9W_vEwgRLqA',
+      'v1_pJI0GeMn7pTPZTxhN0yZHzstMLU',
+      'v1_qf7NIatSkW1hQU3k1Wam-0B-07U',
+    ]);
+    expect(detail.episodes.map((e) => e.title).toList(), ['第1集', '第2集', '第3集']);
+  });
+
+  test('红果取流：令牌 vid 走 fallback-play-info 拿正片且不挂 360p 死链', () async {
+    final client = HongguoContentClient(
+      MockClient((request) async {
+        if (request.url.path.contains('fallback-play-info')) {
+          expect(jsonDecode(request.body)['item_id'], 'v1_OrVn8y1MeME');
+          return http.Response(
+            '{"main_url":"https://example.test/full.mp4"}',
+            200,
+          );
+        }
+        return http.Response('<html></html>', 200);
+      }),
+    );
+    final source = await client.playSource(
+      const DramaSiteEpisode(
+        videoId: 'v1_OrVn8y1MeME',
+        title: '第1集',
+        seriesId: '123',
+      ),
+    );
+    expect(source.url, 'https://example.test/full.mp4');
+    expect(source.variants, isEmpty);
+  });
+
+  test('红果取流：令牌 vid 两路皆失败时如实报错，不退已 404 的 360p 直链', () async {
+    final client = HongguoContentClient(
+      MockClient((_) async => http.Response('<html></html>', 200)),
+    );
+    await expectLater(
+      client.playSource(
+        const DramaSiteEpisode(
+          videoId: 'v1_OrVn8y1MeME',
+          title: '第1集',
+          seriesId: '123',
+        ),
+      ),
+      throwsStateError,
+    );
+    final mirror = HgtvMirrorContentClient(
+      MockClient((_) async => http.Response('{}', 200)),
+    );
+    await expectLater(
+      mirror.playSource(
+        const DramaSiteEpisode(videoId: 'v1_OrVn8y1MeME', title: '第1集'),
+      ),
+      throwsStateError,
+    );
+  });
+
   test('饭果列表与详情解析：搜索结果成卡片，详情分集直链成播放地址', () {
     final items = FanguoContentClient.parseCatalog({
       'result': {
@@ -365,6 +431,44 @@ void main() {
     expect(items.first.id, '12345');
     expect(items.first.title, '搜索样本剧');
     expect(items.first.remark, '共20集');
+  });
+
+  test('红果搜索接口解析：/api/search/result 顶层 searchList 成卡片', () {
+    // 2026-11-28 真网实测形态：搜索页 SSR 已无数据，结果走 JSON
+    // 接口，video_data 字段与旧内嵌数据一致。
+    final items = parseHongguoSearchApi(
+      '{"searchList":[{"doc_type":23,"name":"温夜潮湿","keyword":"7710503618658454553","video_data":{"series_id":"7710503618658454553","series_title":"温夜潮湿","series_cover":"https://example.test/cover.jpg","episode_cnt":78,"episode_right_text":"全78集"}}],"totalCount":"211","hasMore":true}',
+    );
+    expect(items.length, 1);
+    expect(items.first.id, '7710503618658454553');
+    expect(items.first.title, '温夜潮湿');
+    expect(items.first.cover, 'https://example.test/cover.jpg');
+    expect(items.first.remark, '全78集');
+    expect(parseHongguoSearchApi('<html></html>'), isEmpty);
+    expect(parseHongguoSearchApi('{"code":"invalid_query"}'), isEmpty);
+  });
+
+  test('红果搜索：走接口拿结果，不再依赖已无数据的搜索页', () async {
+    final client = HongguoContentClient(
+      MockClient((request) async {
+        if (request.url.path.contains('/api/search/result')) {
+          expect(request.url.queryParameters['query'], '温夜');
+          // http.Response(String) 按 latin1 编码、带中文会抛错，
+          // 真实响应是 UTF-8 字节，这里按字节构造才与真网同形。
+          return http.Response.bytes(
+            utf8.encode(
+              '{"searchList":[{"keyword":"7710503618658454553","video_data":{"series_id":"7710503618658454553","series_title":"温夜潮湿","episode_right_text":"全78集"}}]}',
+            ),
+            200,
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return http.Response('<html></html>', 200);
+      }),
+    );
+    final items = await client.search('温夜');
+    expect(items.length, 1);
+    expect(items.first.title, '温夜潮湿');
   });
 
   test('河果搜索解析：data.bookList 成卡片', () {

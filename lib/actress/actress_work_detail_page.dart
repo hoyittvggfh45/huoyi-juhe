@@ -27,10 +27,20 @@ import 'actress_avatar.dart';
 import 'actress_adapter_http.dart'
     show FeedProbeFetch, feedProbePlayable, probeStreamHead;
 import 'actress_adapter_repository.dart' show AppRepository;
+import 'actress_adapter_store.dart' show LocalStore;
 import 'actress_error_text.dart';
 import 'actress_inline_player.dart';
+import 'actress_crosssite_probe.dart'
+    show
+        CrossSiteLine,
+        CrossSiteProbeResult,
+        CrossSiteProbeService,
+        CrossSiteRowPlan,
+        CrossSiteVersion,
+        planCrossSiteRows;
 import 'actress_javdb_api.dart';
 import 'actress_javdb_image.dart';
+import 'javdb_detail_sections.dart';
 import 'actress_still_capture.dart';
 import 'actress_library_db.dart' show ActressLibraryDbFallback;
 import 'actress_magnet_state.dart';
@@ -131,6 +141,7 @@ class ActressWorkDetailPage extends StatefulWidget {
     required this.repository,
     this.onlineFetch,
     this.javdbClient,
+    this.javdbProbeService,
     this.stillCapturer,
     this.stillCache,
     this.probeFetch,
@@ -162,6 +173,7 @@ class ActressWorkDetailPage extends StatefulWidget {
     required this.repository,
     this.onlineFetch,
     this.javdbClient,
+    this.javdbProbeService,
     this.stillCapturer,
     this.stillCache,
     this.probeFetch,
@@ -197,6 +209,7 @@ class ActressWorkDetailPage extends StatefulWidget {
     required this.repository,
     this.onlineFetch,
     this.javdbClient,
+    this.javdbProbeService,
     this.stillCapturer,
     this.stillCache,
     this.probeFetch,
@@ -230,6 +243,9 @@ class ActressWorkDetailPage extends StatefulWidget {
   final AppRepository repository;
   final ActressOnlineFetch? onlineFetch;
   final JavdbApiClient? javdbClient;
+
+  /// JavDB 三件在线播放页签的探活服务（测试/预览注入缝）；为空时组件以仓储现建。
+  final CrossSiteProbeService? javdbProbeService;
 
   /// 剧照截帧器（JavDB 无剧照时的兜底）：测试注入假实现，
   /// 生产缺省走 MediaKitStillCapturer。
@@ -1873,6 +1889,7 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
               key: ValueKey('inline-$_playingLineId-$_playingUrl'),
               url: playingUrl,
               poster: _poster,
+              title: _code.isNotEmpty ? _code : _title,
               playerFactory: widget.playerFactory,
               onPlaybackError: _onInlinePlaybackError,
               onFullscreen: (position) =>
@@ -2155,8 +2172,184 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
           const SizedBox(height: 8),
           _worksRail(_mayLike, 'like'),
         ],
+        // JavDB 三件（评论/相关清单/在线播放）：滚动内容最末尾的
+        // 独立内容区，与海报播放键背后的竞速/隐藏线路口径无关；
+        // 番号解析无精确命中时组件自己不渲染。在线页签除固定
+        // 六家外一并搜本地站（localPlans）；探到的线路经
+        // onProbeFound 接入本页线路池当真线路（新令 5），自动
+        // 播受数据库优先压住（新令 6，见 _javdbAutoPlaySuppressed）。
+        if (_code.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          JavdbDetailSections(
+            code: _code,
+            client: _javdb,
+            repository: widget.repository,
+            onPlayLine: _playJavdbOnlineLine,
+            probeService: widget.javdbProbeService,
+            localPlans: _localPlansForJavdbSections,
+            onAutoPlayLine: _autoPlayJavdbOnlineLine,
+            onProbeFound: _adoptCrossSiteResult,
+            autoPlaySuppressed: _javdbAutoPlaySuppressed,
+          ),
+        ],
       ],
     );
+  }
+
+  /// 本地站探活计划（JavDB 在线页签用）：照 ActressPlayChain
+  /// 的取法，用共享 LocalStore 现算 planCrossSiteRows，页面
+  /// 生命周期内只算一次。站表读不到时回空表（页签只剩固定
+  /// 六家），不挡页签主链。当前作品来源（数据库/ Dart 在线
+  /// 源）不是计划里的站，不需要剔除；与六家同站的去重在组
+  /// 件合并时做。
+  List<CrossSiteRowPlan>? _javdbLocalPlans;
+
+  List<CrossSiteRowPlan> get _localPlansForJavdbSections {
+    final cached = _javdbLocalPlans;
+    if (cached != null) return cached;
+    List<CrossSiteRowPlan> plans;
+    try {
+      final store = LocalStore.instance;
+      plans = planCrossSiteRows(
+        sites: store.visibleSources,
+        siteVisible: store.siteVisible,
+      );
+    } catch (_) {
+      plans = const [];
+    }
+    return _javdbLocalPlans = plans;
+  }
+
+  /// 数据库已有可播直达线路：本地详情 playUrls 线（开页即带
+  /// target）或按番号反查线已解出地址。
+  bool get _hasPlayableDbLine {
+    for (final line in _lines) {
+      if (line.id.startsWith('local-') && line.target != null) return true;
+    }
+    return false;
+  }
+
+  /// 新令 6「数据库有就播放数据库」的自动播压住判定：库内
+  /// 磁力（_dbMagnets，走磁力播放流）在场、可播数据库线路在
+  /// 场、或按番号反查还没落定（在搜）——任一成立都不自动
+  /// 播搜到的线路；全部落定且一条都没有，才放行自动播。
+  bool get _javdbAutoPlaySuppressed {
+    if (_dbMagnets.isNotEmpty) return true;
+    if (_hasPlayableDbLine) return true;
+    for (final line in _lines) {
+      if (line.id == 'local-by-code' &&
+          line.status == _LineStatus.searching) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// 跨站线路在本页线路池里的 id：站 id + 版本 + 集序号，
+  /// 同一条线复用同一个 _Line，不重复登记。
+  String _crossSiteLineId(CrossSiteVersion version, CrossSiteLine line) =>
+      'xsite-${version.detail.drama.source}|${version.label}|'
+      '${line.episodeIndex}';
+
+  /// 新令 5「搜出来自动接入播放线路」：把页签探到的一条线路
+  /// 登记进本页线路池（追加在既有线路之后——数据库线路恒在
+  /// 前，搜到的只作备选），成为真线路：海报竞速可挑、播中
+  /// 报错自动换线会换到、点 chip 播的就是池里这一条。只追
+  /// 加不覆盖，回写天然无竞态覆盖问题。
+  _Line _registerCrossSiteLine(CrossSiteVersion version, CrossSiteLine line) {
+    final id = _crossSiteLineId(version, line);
+    for (final row in _lines) {
+      if (row.id == id) return row;
+    }
+    final created = _Line(
+      id: id,
+      label: version.label,
+      resolver: () => _resolveCrossSiteTarget(version, line),
+    );
+    // 探活已 found：状态直接 ready，地址点播/竞速时按需解。
+    created.status = _LineStatus.ready;
+    _lines.add(created);
+    return created;
+  }
+
+  /// 跨站线路取址：取版本详情里线路对应的集，走仓储 resolve
+  /// 解可播地址；解不出回 null（不抛、不提示，出口在调用方）。
+  Future<ActressPlayTarget?> _resolveCrossSiteTarget(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    final episodes = version.detail.episodes;
+    if (line.episodeIndex < 0 || line.episodeIndex >= episodes.length) {
+      return null;
+    }
+    try {
+      final plan = await widget.repository.resolve(
+        version.detail.drama,
+        episodes[line.episodeIndex],
+      );
+      if (plan.url.isEmpty) return null;
+      return ActressPlayTarget(plan.url, plan.headers);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 探到线路的接入回写（组件 onProbeFound）：接入守卫（火
+  /// 蚁对账 ①②）——回写前以当下状态再验：数据库已有可播直
+  /// 达线路时，搜到的线路不进主线路池（页签内仍可手点播），
+  /// 防探活途中数据库线路刚落定还往池里塞备选造成优先级混
+  /// 乱。归属上只写本页自有线路池，不另起第二套线路体系，
+  /// 与本页开页补线流程（_appendOnlineLines）不双重补线。
+  void _adoptCrossSiteResult(CrossSiteProbeResult result) {
+    if (!mounted) return;
+    if (_hasPlayableDbLine) return;
+    for (final version in result.versions) {
+      for (final line in version.lines) {
+        _registerCrossSiteLine(version, line);
+      }
+    }
+  }
+
+  /// JavDB 在线播放页签的线路起播（手点）：走
+  /// [_startCrossSiteLine]，解不出地址只给中文提示，不动竞
+  /// 速与隐藏线路口径。
+  Future<void> _playJavdbOnlineLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    if (await _startCrossSiteLine(version, line)) return;
+    if (!mounted) return;
+    _snack('这条线路暂时播不了');
+  }
+
+  /// JavDB 页签自动播：先登记进备选池，再以当下状态复验数
+  /// 据库优先（守卫②）——压住判定成立就只入池不起播；放行
+  /// 才走与手点同一条起播路。返回是否真起播。
+  Future<bool> _autoPlayJavdbOnlineLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    _registerCrossSiteLine(version, line);
+    if (_javdbAutoPlaySuppressed) return false;
+    return _startCrossSiteLine(version, line);
+  }
+
+  /// 页签线路起播（手点与自动播共用）：登记进线路池后走仓
+  /// 储 resolve → 既有 _startPlayback 在海报区内嵌起播（与
+  /// 竞速赢家同一条路）。解出的地址写回池里那条线，竞速/
+  /// 换线复用同一份；解不出返回 false。
+  Future<bool> _startCrossSiteLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    final playLine = _registerCrossSiteLine(version, line);
+    var target = playLine.target;
+    target ??= await _resolveCrossSiteTarget(version, line);
+    if (target == null) return false;
+    playLine.target = target;
+    playLine.verified = true;
+    await _startPlayback(playLine, target);
+    return true;
   }
 
   Widget _sectionTitle(String text) => Text(

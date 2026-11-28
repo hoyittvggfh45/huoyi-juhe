@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import '../services/source_registry.dart' show SourceRegistry;
 import 'actress_adapter_repository.dart';
 import 'actress_adapter_models.dart';
 
@@ -177,6 +178,43 @@ const crossSitePrioritySiteIds = <String>[
   'jar:zakatv:ZakaMirror',
   'jar:missav30:missavt',
   'jar:zakatv:ZakaJable',
+];
+
+/// JavDB 详情页「在线平台」六家（数据层常量）：前四家非懒
+/// 查、MissAV 与 Jable 懒查（盾站/慢站口径与
+/// [crossSiteLazySiteIds] 一致）。
+const javdbOnlineProviders = <CrossSiteProvider>[
+  CrossSiteProvider(id: 'avdb', name: 'AVDB', siteIds: ['avdb'], lazy: false),
+  CrossSiteProvider(
+    id: 'javmenu',
+    name: 'JavMenu',
+    siteIds: ['javmenu'],
+    lazy: false,
+  ),
+  CrossSiteProvider(
+    id: 'av01',
+    name: 'AV01',
+    siteIds: ['jar:zakatv:zakav01'],
+    lazy: false,
+  ),
+  CrossSiteProvider(
+    id: 'memojav',
+    name: 'MemoJav',
+    siteIds: ['memojav'],
+    lazy: false,
+  ),
+  CrossSiteProvider(
+    id: 'missav',
+    name: 'MissAV',
+    siteIds: ['jar:missav30:ZakaMissav'],
+    lazy: true,
+  ),
+  CrossSiteProvider(
+    id: 'jable',
+    name: 'Jable',
+    siteIds: ['jar:zakatv:ZakaJable'],
+    lazy: true,
+  ),
 ];
 
 /// 演员库兜底站序（用户令）：MJV 一家优先——jar、py、Go 槽；18AV
@@ -402,10 +440,40 @@ class CrossSiteProbeService {
     this.eagerBudget = const Duration(seconds: 60),
     this.concurrency = 4,
     this.maxVersions = 3,
-  });
+    this.slowTimeout = const Duration(seconds: 150),
+    Future<bool> Function(String siteId)? clientAvailable,
+  }) : clientAvailable = clientAvailable ?? _registryClientAvailable;
 
   final AppRepository repository;
   final Duration perSiteTimeout;
+
+  /// 慢源探活超时：JavMenu / MemoJav 按番号实搜要 90–120 秒，
+  /// 用普通超时会被误杀（火蚁实证 SSIS-001 在 JavMenu 实有
+  /// 23 命中、按 20 秒超时全丢）。这两家单独放长到 150 秒：
+  /// 快源先回先用，慢源回来再追加线路；没回来之前行保持
+  /// probing（界面「查询中」），不许标未找到/失败。
+  final Duration slowTimeout;
+
+  /// 慢源站 id（直写 seed_ 与裸 id 两种形态都认）。
+  static const slowProbeSiteIds = <String>{
+    'seed_javmenu',
+    'seed_memojav',
+    'javmenu',
+    'memojav',
+  };
+
+  /// 某站本次探活的实际超时（慢源走 [slowTimeout]）。
+  Duration timeoutFor(String siteId) =>
+      slowProbeSiteIds.contains(siteId) ? slowTimeout : perSiteTimeout;
+
+  /// 起探前判站客户端在否（注入缝：测试可换假判据）：站根本没
+  /// 接入（注册表里取不到客户端）时探活直接判 unavailable
+  /// （未接入），不再让 searchAcross 按站静默回空、冒充
+  /// 「未找到」。生产判据走 SourceRegistry.clientFor。
+  final Future<bool> Function(String siteId) clientAvailable;
+
+  static Future<bool> _registryClientAvailable(String siteId) async =>
+      await SourceRegistry.instance.clientFor(siteId) != null;
 
   /// 自动探活波次的总预算：预算耗尽时尚未起跑的计划不再起跑，
   /// 调用方将其改走懒查（“点击查询”）；已起跑的探活跑到单站
@@ -422,12 +490,28 @@ class CrossSiteProbeService {
     String avId,
   ) async {
     final stopwatch = Stopwatch()..start();
+    // 未接入判据（2026-11-28 补接）：客户端取不到 = 这家站压
+    // 根没接进来，直接判 unavailable，与「搜过没有」（empty）
+    // 和「搜索失败」（failed）三分。判据本身出错不挡探活：
+    // 照常往下探，探不通自有 failed 兜底。
+    try {
+      if (!await clientAvailable(siteId)) {
+        return CrossSiteProbeResult(
+          provider: provider,
+          siteId: siteId,
+          status: CrossSiteProbeStatus.unavailable,
+          latency: stopwatch.elapsed,
+        );
+      }
+    } catch (_) {
+      // 判据出错：继续探活。
+    }
     try {
       final result = await _probe(
         provider,
         siteId,
         avId,
-      ).timeout(perSiteTimeout);
+      ).timeout(timeoutFor(siteId));
       return CrossSiteProbeResult(
         provider: result.provider,
         siteId: result.siteId,

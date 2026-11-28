@@ -14,8 +14,8 @@ import 'package:fqapp/services/idj_plugin_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 演员库数据库激活批测试（2026-11-27）：
-/// - 版本门判定与 schema_meta 读取；
-/// -.sql 导入走真默认门：无版本字段拒收、原库不动；
+/// - schema_meta 版本字段只留痕回读（2026-11-28 版本门全拆）；
+/// -.sql 导入无版本门：无字段/format 任意值照常换库；
 /// - 没导演员库时：页签进得去只有中文
 /// 引导、读库层静默回失败、全局搜索接缝不出段、不牵连
 /// 远程（插件）存值、界面不露英文异常；
@@ -181,106 +181,52 @@ tearDown(() {
 if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
 });
 
-group('版本门判定 actressLibraryVersionError', () {
-test('全空（无 schema_meta）：缺字段中文原因', () {
-final error = actressLibraryVersionError(
-const ActressLibraryVersionInfo(),
-);
-expect(error, contains('没有版本字段'));
-expect(error, contains('旧版库'));
+group('版本字段只留痕（2026-11-28 版本门全拆）', () {
+test('缺字段/format=2/format 任意值：读出来什么样就是什么样、无判定', () async {
+// 版本门判定函数已整删：ActressLibraryVersionInfo 只是
+// 留痕数据，readActressLibraryVersion 对缺字段、format
+// 不是女优库、format_version 写 2 或 2099 都原样回读，
+// 没有任何一处据此拒收。
+Future<ActressLibraryVersionInfo> readWith(
+List<Map<String, Object?>> rows,
+) {
+return readActressLibraryVersion((sql, [args]) async {
+if (sql.contains('sqlite_master')) {
+return [
+{'name': 'schema_meta'},
+];
+}
+if (sql.contains('FROM schema_meta')) return rows;
+return [];
 });
+}
 
-test('format 不是 actress_library：同样按缺字段', () {
-final error = actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'site_library',
-formatVersion: '1',
-coreVersion: '2026.11.27',
-),
-);
-expect(error, contains('没有版本字段'));
-});
+final missing = await readWith(const []);
+expect(missing.format, '');
+expect(missing.formatVersion, '');
+expect(missing.libraryVersion, '');
 
-test('格式版本对不上：写明库的格式与当前只认的格式', () {
-final error = actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '2',
-coreVersion: '2026.11.27',
-),
-);
-expect(error, contains('格式版本 2'));
-expect(error, contains('格式版本 1 不一致'));
-});
+final format2 = await readWith(const [
+{'key': 'format', 'value': 'actress_library'},
+{'key': 'format_version', 'value': '2'},
+{'key': 'core_version', 'value': '2099.01.01'},
+{'key': 'library_version', 'value': '2099v1'},
+]);
+expect(format2.formatVersion, '2');
+expect(format2.coreVersion, '2099.01.01');
+expect(format2.libraryVersion, '2099v1');
 
-test('核心版本对不上也放行（2026-11-28 取消核心门）', () {
-expect(
-actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '1',
-coreVersion: '2027.01.01',
-),
-),
-isNull,
-);
-});
-
-test('核心版本是未来值 2099 也照常放行（防把门加回来）', () {
-expect(
-actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '1',
-coreVersion: '2099.01.01',
-libraryVersion: '2099v1',
-),
-),
-isNull,
-);
-});
-
-test('缺 core_version 字段（format 与格式版本在）：放行', () {
-expect(
-actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '1',
-),
-),
-isNull,
-);
-});
-
-test('全对：放行（返回 null）', () {
-expect(
-actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '1',
-coreVersion: '2026.11.27',
-libraryVersion: '20261127v5',
-),
-),
-isNull,
-);
-});
-
-test('注入覆盖：当前只认格式 2 时格式 1 被拒', () {
-final error = actressLibraryVersionError(
-const ActressLibraryVersionInfo(
-format: 'actress_library',
-formatVersion: '1',
-coreVersion: '2026.11.27',
-),
-supportedFormatVersion: '2',
-);
-expect(error, contains('格式版本 2 不一致'));
+final otherFormat = await readWith(const [
+{'key': 'format', 'value': 'site_library'},
+{'key': 'format_version', 'value': '99'},
+]);
+expect(otherFormat.format, 'site_library');
+expect(otherFormat.formatVersion, '99');
 });
 });
 
 group('readActressLibraryVersion 读取', () {
-test('没有 schema_meta 表：全空、hasVersionFields 为假', () async {
+test('没有 schema_meta 表：全空', () async {
 final info = await readActressLibraryVersion((sql, [args]) async {
 if (sql.contains('sqlite_master')) {
 return [
@@ -289,7 +235,6 @@ return [
 }
 return [];
 });
-expect(info.hasVersionFields, isFalse);
 expect(info.format, '');
 });
 
@@ -310,7 +255,6 @@ return [
 }
 return [];
 });
-expect(info.hasVersionFields, isTrue);
 expect(info.format, 'actress_library');
 expect(info.formatVersion, '1');
 expect(info.coreVersion, '2026.11.27');
@@ -321,11 +265,12 @@ test('查询抛错：吞掉回全空，不把异常抛给导入链', () async {
 final info = await readActressLibraryVersion(
 (sql, [args]) async => throw StateError('boom'),
 );
-expect(info.hasVersionFields, isFalse);
+expect(info.format, '');
+expect(info.formatVersion, '');
 });
 });
 
-group('.sql 导入版本门（真默认门）', () {
+group('.sql 导入无版本门（2026-11-28 全拆）', () {
 Future<SqlImportExecutor> Function(String) factoryFor(
 _MetaExecutor executor,
 ) {
@@ -335,7 +280,9 @@ return executor;
 };
 }
 
-test('无版本字段的.sql 被拒：原库不动、不关库、临时文件清掉', () async {
+test('无版本字段的.sql 照常放行：换库成功（旧例翻转）', () async {
+// 版本门全拆后：没有 schema_meta 的 .sql 只过结构校验，
+// 结构没问题就换库，不再整单拒收。
 final sqlFile = File('${tempDir.path}/old.sql')
 ..writeAsStringSync(_sampleSql);
 final livePath = '${tempDir.path}/女优库.db';
@@ -350,18 +297,46 @@ dbPath: livePath,
 closeDatabase: () async => closeCalls++,
 onProgress: (_) {},
 );
-expect(result.ok, isFalse);
-// 拒收原因是门自己的中文原因，不套「导入失败：」前缀。
-expect(result.error, contains('没有版本字段'));
-expect(result.error, isNot(startsWith('导入失败')));
-expect(result.needsReload, isFalse);
-expect(closeCalls, 0);
-expect(await File(livePath).readAsString(), 'OLDDB');
-expect(await File('$livePath.bak').exists(), isFalse);
+expect(result.ok, isTrue, reason: result.error);
+expect(result.videos, 1);
+expect(result.needsReload, isTrue);
+expect(closeCalls, 1);
+expect(await File(livePath).readAsString(), 'NEWDB');
+expect(await File('$livePath.bak').readAsString(), 'OLDDB');
 expect(await File('$livePath.importing').exists(), isFalse);
 });
 
-test('带版本字段且对得上的.sql 放行：换库成功', () async {
+test('format_version 写 2 的.sql 照常放行：换库成功', () async {
+final executor = _MetaExecutor()
+..metaRows = const [
+{'key': 'format', 'value': 'actress_library'},
+{'key': 'format_version', 'value': '2'},
+{'key': 'core_version', 'value': '2099.01.01'},
+{'key': 'library_version', 'value': '2099v1'},
+];
+final stamped2 = _stampedSql
+.replaceAll("'format_version', '1'", "'format_version', '2'")
+.replaceAll("'core_version', '2026.11.27'", "'core_version', '2099.01.01'")
+.replaceAll("'library_version', '20261127v5'", "'library_version', '2099v1'");
+final sqlFile = File('${tempDir.path}/v2099.sql')
+..writeAsStringSync('$_sampleSql\n$stamped2');
+final livePath = '${tempDir.path}/女优库.db';
+await File(livePath).writeAsString('OLDDB');
+final importer = ActressSqlImporter(
+executorFactory: factoryFor(executor),
+);
+final result = await importer.importFile(
+sqlPath: sqlFile.path,
+dbPath: livePath,
+closeDatabase: () async {},
+onProgress: (_) {},
+);
+expect(result.ok, isTrue, reason: result.error);
+expect(result.videos, 1);
+expect(await File(livePath).readAsString(), 'NEWDB');
+});
+
+test('带版本字段的.sql 放行：换库成功', () async {
 final executor = _MetaExecutor()
 ..metaRows = const [
 {'key': 'format', 'value': 'actress_library'},

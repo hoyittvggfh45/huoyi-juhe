@@ -229,7 +229,6 @@ Future<void> _runCase({
   }
 
   final importer = ActressSqlImporter(
-    versionGate: (_) async => null,
     executorFactory: (tempPath) => FfiImportExecutor.openDb(tempPath),
   );
   final result = await importer.importFile(

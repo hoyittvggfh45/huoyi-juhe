@@ -9,7 +9,7 @@ import 'package:fqapp/actress/actress_library_version.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 双库＋激活批测试：来源层（选择存取兼容、激活解析、存量
-/// 过渡）、.db 收编判定与版本门（注入式假校验器/假版本检查，
+/// 过渡）、.db 收编判定（注入式假校验器/假版本回读，
 /// 不硬依赖真机 sqflite）、外置导入激活、管理页两卡渲染与
 /// 未激活引导。sqflite 在 flutter test 里跑不起来，凡是要真
 /// 开库的地方都注入假件（与 actress_sql_import_test 同款口径）。
@@ -28,7 +28,7 @@ ActressDbSource fakeSource({
   );
 }
 
-/// 带完整版本字段的假版本信息（版本门通过样）。
+/// 带完整版本字段的假版本信息（留痕回读样）。
 const stampedInfo = ActressLibraryVersionInfo(
   format: 'actress_library',
   formatVersion: '1',
@@ -36,7 +36,7 @@ const stampedInfo = ActressLibraryVersionInfo(
   libraryVersion: '20261127v5',
 );
 
-/// 版本门放行假件。
+/// 版本信息回读假件（带完整字段）。
 Future<({ActressLibraryVersionInfo info, String? error})> passingVersion(
   String path,
 ) async => (info: stampedInfo, error: null);
@@ -272,7 +272,7 @@ void main() {
       dbVersionChecker: versionChecker ?? passingVersion,
     );
 
-    test('校验＋版本都过：拷进 imported 槽、旧 imported 留 .bak、落激活记录', () async {
+    test('结构校验过：拷进 imported 槽、旧 imported 留 .bak、落激活记录', () async {
       File(importedDb).writeAsStringSync('OLDIMP');
       final picked = File('${tempDir.path}/picked.db')
         ..writeAsStringSync('NEWDB');
@@ -351,7 +351,7 @@ void main() {
       expect(File(importedDb).readAsStringSync(), 'OLDIMP');
     });
 
-    test('版本字段缺失被拒：连复制都不发生、imported 不动、不关库、无新激活', () async {
+    test('版本字段缺失照常导入（2026-11-28 版本门全拆，旧例翻转）', () async {
       File(importedDb).writeAsStringSync('OLDIMP');
       final picked = File('${tempDir.path}/old.db')
         ..writeAsStringSync('OLDDB');
@@ -365,21 +365,23 @@ void main() {
         (_) async => const ActressDbValidation(ok: true, works: 7),
         versionChecker: (_) async => (
           info: const ActressLibraryVersionInfo(),
-          error: actressLibraryVersionError(
-            const ActressLibraryVersionInfo(),
-          ),
+          error: null,
         ),
       ).importLocalFile(
         localPath: picked.path,
         closeDatabase: () async => closeCalls++,
       );
-      expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('没有版本字段'));
-      expect(outcome.needsReload, isFalse);
-      expect(closeCalls, 0);
-      expect(File(importedDb).readAsStringSync(), 'OLDIMP');
-      expect(File('$importedDb.bak').existsSync(), isFalse);
+      // 无版本字段不再拒收：结构校验过就拷入、换库、落激活。
+      expect(outcome.ok, isTrue, reason: outcome.error);
+      expect(outcome.videos, 7);
+      expect(outcome.needsReload, isTrue);
+      expect(closeCalls, 1);
+      expect(File(importedDb).readAsStringSync(), 'OLDDB');
+      expect(File('$importedDb.bak').readAsStringSync(), 'OLDIMP');
       expect(File('$importedDb.importing-db').existsSync(), isFalse);
+      final status = await source.status();
+      expect(status.activated, isTrue);
+      expect(status.activation!.origin, 'import');
     });
 
     test('核心版本是未来值 2099 也照常导入（2026-11-28 取消核心门）', () async {
@@ -401,7 +403,7 @@ void main() {
         (_) async => const ActressDbValidation(ok: true, works: 7),
         versionChecker: (_) async => (
           info: futureInfo,
-          error: actressLibraryVersionError(futureInfo),
+          error: null,
         ),
       ).importLocalFile(localPath: picked.path, closeDatabase: () async {});
       expect(outcome.ok, isTrue);
@@ -494,10 +496,12 @@ void main() {
       expect(outcome.error, contains('还没绑定'));
     });
 
-    test('外置缺版本字段：存量放行、落 legacy 激活（2026-11-28 口径）', () async {
+    test('外置缺版本字段：照常导入、落 import 激活（2026-11-28 版本门全拆）', () async {
       // 外置 MYTV/db/女优库.db 是版本门制度之前发给用户的定版
-      // 库（v4），压根没有版本字段；结构校验过关时按存量放行，
-      // 不再报「没有版本字段无法激活」。
+      // 库（v4），压根没有版本字段；版本门全拆后不再需要
+      // legacy 例外通道，结构校验过关就与普通导入同路收编，
+      // 激活记录记 origin=import（存量补记的 legacy 机制在
+      // 来源层另有其路，不经这里）。
       File(externalDb).writeAsStringSync('EXTDB');
       final source = fakeSource(
         externalPath: externalDb,
@@ -509,9 +513,7 @@ void main() {
             const ActressDbValidation(ok: true, works: 9),
         dbVersionChecker: (_) async => (
           info: const ActressLibraryVersionInfo(),
-          error: actressLibraryVersionError(
-            const ActressLibraryVersionInfo(),
-          ),
+          error: null,
         ),
       );
       final outcome = await service.importExternalFile(
@@ -521,12 +523,12 @@ void main() {
       expect(outcome.videos, 9);
       expect(File(importedDb).readAsStringSync(), 'EXTDB');
       final status = await source.status();
-      expect(status.activation?.origin, 'legacy');
+      expect(status.activation?.origin, 'import');
     });
 
-    test('外置格式版本对不上：仍拒、imported 不落地', () async {
-      // 「对不上」的触发条件 2026-11-28 起只剩格式版本（核心
-      // 版本已取消设门，写什么都不拒）。
+    test('外置格式版本写 2：照常导入（2026-11-28 版本门全拆，旧例翻转）', () async {
+      // format_version 写什么都不再拒（核心版本早已不设门，
+      // 格式版本门本批一并拆净），只剩结构校验。
       File(externalDb).writeAsStringSync('EXTDB');
       final source = fakeSource(
         externalPath: externalDb,
@@ -544,15 +546,19 @@ void main() {
             const ActressDbValidation(ok: true, works: 9),
         dbVersionChecker: (_) async => (
           info: info,
-          error: actressLibraryVersionError(info),
+          error: null,
         ),
       );
       final outcome = await service.importExternalFile(
         closeDatabase: () async {},
       );
-      expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('格式版本 2'));
-      expect(File(importedDb).existsSync(), isFalse);
+      expect(outcome.ok, isTrue, reason: outcome.error);
+      expect(outcome.videos, 9);
+      expect(File(importedDb).readAsStringSync(), 'EXTDB');
+      // 版本信息只随激活记录留痕：format 写 2 也原样记下。
+      final status = await source.status();
+      expect(status.activation?.origin, 'import');
+      expect(status.activation?.formatVersion, '2');
     });
   });
 
@@ -687,30 +693,44 @@ void main() {
       expect(status.activation!.origin, 'import');
     });
 
-    testWidgets('点导入激活被版本门拒（格式版本对不上）：中文原因上屏、仍未激活',
+    testWidgets('点导入激活：格式版本任意值照常导入成功（版本门已拆）',
         (tester) async {
+      // 新口径（2026-11-28 版本门全拆）：format_version 写什么
+      // 都不再拒，只剩结构校验；版本字段只随激活记录留痕。
       const info = ActressLibraryVersionInfo(
         format: actressLibraryMetaFormat,
         formatVersion: '2',
         coreVersion: '1999.01.01',
         libraryVersion: 'x',
       );
-      await pumpPage(
+      final source = await pumpPage(
         tester,
         withImported: false,
-        versionChecker: (_) async => (
-          info: info,
-          error: actressLibraryVersionError(info),
-        ),
+        serviceWorks: 7,
+        versionChecker: (_) async => (info: info, error: null),
       );
-      await tester.tap(find.byKey(const ValueKey('dual-import-external')));
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 50));
-      await tester.pump();
-      expect(find.byKey(const ValueKey('dual-error')), findsOneWidget);
-      expect(find.textContaining('格式版本 2'), findsWidgets);
-      expect(find.byKey(const ValueKey('activation-guide')), findsOneWidget);
-      expect(find.byKey(const ValueKey('dual-current-imported')), findsNothing);
+      await tester.runAsync(() async {
+        await tester.tap(find.byKey(const ValueKey('dual-import-external')));
+        for (var i = 0; i < 30; i++) {
+          await Future.delayed(const Duration(milliseconds: 100));
+          await tester.pump(const Duration(milliseconds: 50));
+          if (find
+              .text('外置库导入成功，已激活：7 部作品')
+              .evaluate()
+              .isNotEmpty) {
+            break;
+          }
+        }
+      });
+      expect(find.text('外置库导入成功，已激活：7 部作品'), findsOneWidget);
+      expect(find.byKey(const ValueKey('dual-error')), findsNothing);
+      expect(find.byKey(const ValueKey('activation-guide')), findsNothing);
+      expect(find.byKey(const ValueKey('dual-current-imported')), findsOneWidget);
+      final status = await source.status();
+      expect(status.activated, isTrue);
+      expect(status.activation!.origin, 'import');
+      // 版本只留痕：format 写 2 也原样记下，不参与任何判定。
+      expect(status.activation!.formatVersion, '2');
     });
   });
 }

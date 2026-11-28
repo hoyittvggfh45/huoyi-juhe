@@ -17,28 +17,28 @@ import 'actress_sql_import.dart';
 /// 当库用。
 ///
 /// - .sql / .sql.gz：复用 [ActressSqlImporter]（流式执行→归一化
-///   →校验→版本门→备份 .bak→换库，失败原 imported 不动）。iOS
+///   →结构校验→备份 .bak→换库，失败原 imported 不动）。iOS
 ///   现有 tile 本来就是往同一落点导（iosDbPath 与 imported 槽
 ///   同路径），语义一致、iOS 流程未改。
 /// - .db：先验后换——选中文件先以只读方式打开做结构探测
 ///   （[validateActressDbFile]：严格结构认 videos 表、通用结构认
-///   探测到的作品表，两者都要作品数 > 0），再过版本门
-///   （[checkActressDbFileVersion]：schema_meta 版本字段必须与
-///   当前软件对得上，见 actress_library_version.dart），都过
-///   才拷进 imported 槽：先拷到同目录中转文件，旧 imported 留
-///   .bak，中转改名就位；校验不过给中文报错、imported 槽原样
-///   不动。
+///   探测到的作品表，两者都要作品数 > 0），过了才拷进 imported
+///   槽：先拷到同目录中转文件，旧 imported 留 .bak，中转改名
+///   就位；校验不过给中文报错、imported 槽原样不动。
+///   数据库版本门已全拆（2026-11-28 用户令）：schema_meta 的
+///   版本字段缺失或写任意值都不拒收，版本信息只在换库成功后
+///   回读、随激活记录留痕（见 actress_library_version.dart）。
 /// - 外置文件导入激活（[importExternalFile]）：外置槽的
 ///   MYTV/db/女优库.db 只是导入来源，点它才走上面 .db 同一条
-///   链（校验＋版本门＋拷入 imported 槽），不点不生效；外置
-///   文件本身一个字不写。
+///   链（结构校验＋拷入 imported 槽），不点不生效；外置文件
+///   本身一个字不写。
 ///
 /// 导入成功 = 激活：两路换库成功后都调
 /// [ActressDbSource.markActivated] 落激活记录（origin=import），
 /// 演员库才开始出数据；失败一律不落记录、已激活的旧库不动。
 ///
 /// 报错全中文且分开说：文件读不到 / 格式不对 / 作品数为 0 /
-/// 版本字段缺失或对不上 / 复制失败（空间不足等）各是各的文案。
+/// 复制失败（空间不足等）各是各的文案。
 
 /// .db 校验结果：认得出作品表且作品数 > 0 才 [ok]。
 class ActressDbValidation {
@@ -169,8 +169,10 @@ class ActressDbImportOutcome {
   final bool needsReload;
 }
 
-/// .db 版本门检查（可注入：测试用假件）。回版本信息与中文
-/// 拒收原因（null = 通过）。
+/// .db 版本信息回读（可注入：测试用假件）。换库成功后回读
+/// 新库的 schema_meta 版本字段随激活记录留痕；[error] 只报
+/// 文件读不到/打不开这类结构问题，版本字段本身不再有任何
+/// 拒收判定（2026-11-28 版本门全拆），调用方也不拿它拒收。
 typedef ActressDbVersionChecker = Future<
   ({ActressLibraryVersionInfo info, String? error})
 > Function(String dbPath);
@@ -313,8 +315,8 @@ class ActressDbImportService {
     );
     var warnings = result.warnings;
     if (result.ok) {
-      // 激活：版本门已在导入器内过，这里回读新库版本字段落
-      // 激活记录（回读失败不挡激活，版本信息留空）。
+      // 激活：回读新库版本字段落激活记录留痕（回读失败不挡
+      // 激活，版本信息留空；版本字段不参与任何判定）。
       var info = const ActressLibraryVersionInfo();
       try {
         info = (await _dbVersionChecker(importedPath)).info;
@@ -367,7 +369,7 @@ class ActressDbImportService {
 
   /// 外置文件导入激活：把外置槽当前文件（MYTV/db/女优库.db 或
   /// 其 SAF 镜像落点）当选中文件走 .db 同一条链（结构校验＋
-  /// 版本门＋拷入 imported 槽＋激活）。外置文件只读不写；
+  /// 拷入 imported 槽＋激活）。外置文件只读不写；
   /// 外置没绑定/文件不在回中文原因。
   Future<ActressDbImportOutcome> importExternalFile({
     required Future<void> Function() closeDatabase,
@@ -397,19 +399,17 @@ class ActressDbImportService {
       pickedPath: externalPath,
       importedPath: importedPath,
       closeDatabase: closeDatabase,
-      allowLegacyWhenNoVersionFields: true,
     );
   }
 
-  /// .db 先验后换：结构校验（只读开选中文件）→ 版本门 → 拷
-  /// 中转 → 旧 imported 留 .bak → 中转改名就位 → 落激活记录。
-  /// 任一步失败 imported 原样不动（改名失败且原文件已挪走时
-  /// 从 .bak 恢复）；版本门不过连复制都不发生。
+  /// .db 先验后换：结构校验（只读开选中文件）→ 拷中转 → 旧
+  /// imported 留 .bak → 中转改名就位 → 回读版本字段落激活
+  /// 记录（留痕）。任一步失败 imported 原样不动（改名失败且
+  /// 原文件已挪走时从 .bak 恢复）。
   Future<ActressDbImportOutcome> _importDb({
     required String pickedPath,
     required String importedPath,
     required Future<void> Function() closeDatabase,
-    bool allowLegacyWhenNoVersionFields = false,
     String? sourceName,
   }) async {
     final validation = await _dbValidator(pickedPath);
@@ -418,27 +418,6 @@ class ActressDbImportService {
         ok: false,
         error: validation.error ?? '这个数据库不能用，已取消导入',
       );
-    }
-    // 版本门：结构认得出还不够，版本字段必须与当前软件对得上。
-    // 例外（2026-11-28 解码修复批）：外置库导入激活传
-    // [allowLegacyWhenNoVersionFields]——外置 MYTV/db/女优库.db
-    // 是版本门制度之前发给用户的定版库（v4，449,339 部），压根
-    // 没有 schema_meta、更没有版本字段，用户一直拿它当外置库
-    // 用；点「导入激活」却被告知「没有版本字段无法激活」，与
-    // 存量口径（已在用的库继续可用）自相矛盾。故外置这条路：
-    // 结构校验已过、且纯粹是缺字段（字段在但对不上仍拒），
-    // 按存量放行、激活记录记 origin=legacy。统一口选任意 .db
-    // 文件导入不传此旗，硬门不松。
-    final version = await _dbVersionChecker(pickedPath);
-    var activatedOrigin = 'import';
-    if (version.error != null) {
-      final missingFieldsOnly = !version.info.hasVersionFields &&
-          version.error!.contains('没有版本字段');
-      if (allowLegacyWhenNoVersionFields && missingFieldsOnly) {
-        activatedOrigin = 'legacy';
-      } else {
-        return ActressDbImportOutcome(ok: false, error: version.error);
-      }
     }
     final stagingPath = '$importedPath.importing-db';
     final staging = File(stagingPath);
@@ -490,11 +469,17 @@ class ActressDbImportService {
         needsReload: true,
       );
     }
+    // 回读新库版本字段落激活记录留痕（回读失败不挡激活，
+    // 版本信息留空；版本字段不参与任何判定）。
+    var info = const ActressLibraryVersionInfo();
+    try {
+      info = (await _dbVersionChecker(importedPath)).info;
+    } catch (_) {}
     await _source.markActivated(
-      origin: activatedOrigin,
-      libraryVersion: version.info.libraryVersion,
-      formatVersion: version.info.formatVersion,
-      coreVersion: version.info.coreVersion,
+      origin: 'import',
+      libraryVersion: info.libraryVersion,
+      formatVersion: info.formatVersion,
+      coreVersion: info.coreVersion,
     );
     final regWarnings = await _autoRegisterMagnets(
       importedPath,

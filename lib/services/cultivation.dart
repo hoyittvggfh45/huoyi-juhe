@@ -647,6 +647,25 @@ const adultTierRealmNames = <String>['元婴期', '化神期', '炼虚期', '合
 /// 四档 67/69/69/70（missav、javrate 仍钉第 4 档末尾）；存量站只有
 /// 4 站换档且全是提前一档解锁（airav 1→0、shunvwang 2→1、
 /// heitaoduanju 2→1、danaizizy 3→2），无一站推迟。
+///
+/// 2026-11-28 按库内成人标记对齐补齐（用户令「补」）：站点库名单
+/// （roster／stations 表 is_adult）标成人的 canon id 凡不在本表
+/// 的 96 个，按名单 sort 序（即注册序，与 2026-11-22 追加同款）
+/// 追加到表尾。新总数 377，四档 93/94/94/96（missav、javrate
+/// 仍钉第 4 档末尾）。存量 281 站下标不变、分母变大，142 站提前
+/// 一档解锁（3→2 计 70 站、2→1 计 48 站、1→0 计 24 站），无一
+/// 站推迟，与历次追加同型。补入构成：影视站 32、短剧性质 18、
+/// 直播成人 26、核心阅读站 18、小说书源 2。核心阅读站的阅读
+/// 路径本来就按 coreAdultReadingSiteIds 分档，补进本表是为全局
+/// 搜索、站源管理等按 canon id 查档的路径不再漏；短剧站与直播
+/// 站各自专区的站表不查本表、不受影响。首两个补入站（91sanji、
+/// xandaskday，下标 281/282）按公式落第 3 档，其余 94 个落
+/// 第 4 档。注意 huangdou：同一 canon id 同时挂成人 jar 行
+/// （黄豆短剧）与非成人短剧原生行（黄豆），按 canon 补入后裸
+/// id 查档返回第 4 档，全局搜索里短剧站黄豆会按成人站档位
+/// 过滤。此前「从未进过核心的站不分档」的口径自此只适用于
+/// 库内未标成人的站；库内标成人的站一律在表，防漏断言见
+/// test/adult_gate_alignment_test.dart。
 const adultVideoSiteOrder = <String>[
   'mjv011', 'huangguo', 'huangguotv', 'hgtvim', 'huai', 'hl365', 'sex8', 'hgdjv',
   'km2', 'cucumber', 'haijiao', 'md', 'utube', 'av91', 'lxs', 'javrate',
@@ -684,6 +703,18 @@ const adultVideoSiteOrder = <String>[
   'tasexy', 'tianyazy', 'wsyzy', 'wujinzy', 'xhongyan', 'xiguazy', 'xingbazy', 'xingyezy',
   'yayazy', 'yinghuazy', 'yuanlibzy', 'yutuzy', 'zuidazy', 'zy360', 'hstv', 'eroshort', 'whos', 'youzidj', 'yzaikan', 'one', 'tgpianku',
   'youguo', 'manman', 'luguo', 'liuguo', 'liguo', 'ningguo',
+  '91sanji', 'xandaskday', 'aiwu', '91crdjai', 'dabaitu_video', 'huangguomanju', 'aihi', 'aiyinhang',
+  'aipornx', 'ywly', 'kankux', 'sexaix', 'heitao', 'hghub', 'jinguo', 'jinguo_jg',
+  'legado_8008_0', 'legado_8010_0', 'legado_8114_0', 'legado_8140_0', 'lnkl', 'huangdou', 'javverse', 'v01',
+  'hysxs', 'puapua', 'ns', 'coolinet', 'javpk', 'qmdj', 'hxc', 'uu',
+  'hj1', 'jav380', 'avbebe', 'avple', 'njav', 'baoyu', 'qysq', 'hgdjapp',
+  'seku', 'kp14', '-yue2', 'ykf', 'kfz', 'cn', 'bnzb', 'supjav',
+  'rohu', 'yporn', 'javdb', 'livetv', 'qishe', '52av', 'xiuguo', 'maiyoux',
+  'user_m3u', 'm3u_zhubo', 'm3u_luanlun', 'm3u_huayu', 'm3u_guochan', 'm3u_xuesheng', 'm3u_tanhua', 'm3u_riben',
+  'm3u_oumei', 'm3u_heilian', 'm3u_community10', 'm3u_community11', 'm3u_wuma', 'm3u_wanghong', 'm3u_xingba', 'm3u_chengtou',
+  'm3u_zhifu', 'm3u_qunjiao', 'm3u_mingxing', 'm3u_zipai', 'm3u_avxiongdi', 'm3u_guochanse', 'm3u_riben2', '1000novel',
+  '69story', 'buliang', 'canovel', 'cheniyo', 'cjg', 'h528', 'hwg4', 'jywx2',
+  'lbwen', 'ssxxs', 'yinse', '55comics', 'csmanhua', 'ho5ho', 'modu18', 'hsvoice31',
 ];
 
 /// 成人站档位：按在核心登记表里的下标均分 4 档。

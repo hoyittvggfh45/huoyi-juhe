@@ -280,4 +280,20 @@ class CloudDriveContentClient implements DramaSiteContentClient {
     );
     return [for (final drama in result.items) _asItem(drama)];
   }
+
+  /// 文件夹内搜索（网盘多媒体页下钻后在当前文件夹里搜）：走引擎
+  /// 的 query + category 通道，category 归一与 [catalog] 同一口径
+  /// （`folder:<id>` / 裸 id / 根都认）。接口 [DramaSiteContentClient]
+  /// 没有这个方法，这是本客户端的增量能力，不影响站流既有行为。
+  Future<List<DramaSiteItem>> searchIn(String categoryId, String query) async {
+    final needle = query.trim();
+    if (needle.isEmpty) return const [];
+    final result = await _gateway.catalog(
+      source: _source,
+      page: 1,
+      query: needle,
+      category: engineCategoryOf(_effectiveCategoryOf(categoryId)),
+    );
+    return [for (final drama in result.items) _asItem(drama)];
+  }
 }

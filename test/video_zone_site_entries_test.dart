@@ -47,7 +47,7 @@ const _custom = [
 
 void main() {
   group('videoZoneSiteEntries', () {
-    test('午夜 jar 行与内置导入行进内置区·午夜组，用户导入影视站进导入区·视频组', () {
+    test('内置区按内容自动分类：成人 jar 进成人影视·Jar 组、成人种子站进成人影视·Python 组、非成人内置导入站进影视组；用户导入影视站进导入区·视频组', () {
       final entries = videoZoneSiteEntries(_custom, 100000);
       final byId = {for (final e in entries) e.id: e};
 
@@ -61,8 +61,14 @@ void main() {
         'seed_missav',
       ]) {
         expect(byId[id]!.zone, SiteGridZone.builtin, reason: id);
-        expect(byId[id]!.group, SiteGridGroup.midnight, reason: id);
       }
+      // 2026-11-28 自动分类口径（原口径：三者一律进午夜组）：
+      // missav 是成人站——jar 行按来源归 Jar 组、种子行归 Python 组；
+      // builtin-py 无成人标记（不在分档表、非午夜 jar、无 isAdult），
+      // 归非成人「影视」组。
+      expect(byId['jar:zakatv:ZakaMissav']!.group, SiteGridGroup.adultFilmJar);
+      expect(byId['seed_missav']!.group, SiteGridGroup.adultFilmPy);
+      expect(byId['builtin-py']!.group, SiteGridGroup.film);
       // 第四路：用户导入的影视站进导入区·视频组。
       expect(byId['user-py']!.zone, SiteGridZone.import);
       expect(byId['user-py']!.group, SiteGridGroup.video);
@@ -70,7 +76,74 @@ void main() {
       expect(byId.containsKey('user-duanju'), isFalse);
     });
 
-    test('用户导入站撞内置站 id 时保留内置那条（内置区·午夜组）', () {
+    test('打包站点库行（sqlManaged+bundled）进内置区，无 bundled 的 SQL 行仍进导入区', () {
+      final entries = videoZoneSiteEntries([
+        const SourceEntry(
+          id: 'bundled-py',
+          name: '打包站',
+          kind: SourceKind.pyImport,
+          extra: {
+            'builtin': false,
+            'sqlManaged': true,
+            'bundled': true,
+            'contentType': 'video',
+          },
+        ),
+        const SourceEntry(
+          id: 'plain-sql-py',
+          name: '普通站点库站',
+          kind: SourceKind.pyImport,
+          extra: {
+            'builtin': false,
+            'sqlManaged': true,
+            'contentType': 'video',
+          },
+        ),
+      ], 100000);
+      final byId = {for (final e in entries) e.id: e};
+
+      expect(byId['bundled-py']!.zone, SiteGridZone.builtin);
+      expect(byId['plain-sql-py']!.zone, SiteGridZone.import);
+    });
+
+    test('打包站按库内 isAdult 标记分类：成人 py 进成人影视·Python 组、成人 jar 进 Jar 组、非成人进影视组', () {
+      SourceEntry bundled(
+        String id,
+        SourceKind kind, {
+        required bool adult,
+      }) => SourceEntry(
+        id: id,
+        name: id,
+        kind: kind,
+        extra: {
+          'builtin': false,
+          'sqlManaged': true,
+          'bundled': true,
+          'contentType': 'video',
+          'isAdult': adult,
+          // legado 站进统一表第四路要 hasExplore（buildSqlSiteEntries
+          // 给 legado 行恒带此标记）。
+          if (kind == SourceKind.legadoImport) 'hasExplore': true,
+        },
+      );
+      final entries = videoZoneSiteEntries([
+        bundled('sql-adult-py', SourceKind.pyImport, adult: true),
+        bundled('sql-adult-jar', SourceKind.jarImport, adult: true),
+        bundled('sql-adult-book', SourceKind.legadoImport, adult: true),
+        bundled('sql-clean-py', SourceKind.pyImport, adult: false),
+      ], 100000);
+      final byId = {for (final e in entries) e.id: e};
+
+      expect(byId['sql-adult-py']!.group, SiteGridGroup.adultFilmPy);
+      expect(byId['sql-adult-jar']!.group, SiteGridGroup.adultFilmJar);
+      expect(byId['sql-adult-book']!.group, SiteGridGroup.adultFilmBook);
+      expect(byId['sql-clean-py']!.group, SiteGridGroup.film);
+      for (final e in entries) {
+        expect(e.zone, SiteGridZone.builtin, reason: e.id);
+      }
+    });
+
+    test('用户导入站撞内置站 id 时保留内置那条（内置区·影视组）', () {
       final entries = videoZoneSiteEntries([
         ..._custom,
         // 与内置导入行同 id 的用户行：统一表去重只留内置那条，
@@ -86,7 +159,7 @@ void main() {
 
       expect(entries.where((e) => e.id == 'builtin-py').length, 1);
       expect(byId['builtin-py']!.zone, SiteGridZone.builtin);
-      expect(byId['builtin-py']!.group, SiteGridGroup.midnight);
+      expect(byId['builtin-py']!.group, SiteGridGroup.film);
     });
 
     test('隐藏只认归一化后的核心站 id：jar 行与种子行同站一起藏', () {

@@ -82,8 +82,8 @@ class _ActressIosImportTileState extends State<ActressIosImportTile> {
         isCancelled: () => _cancelled,
       );
       if (result.ok) {
-        // 激活（2026-11-27 演员库激活批）：版本门已在导入器内
-        // 过，回读新库版本字段落激活记录，演员库才出数据。
+        // 激活：回读新库版本字段落激活记录留痕（版本门已全
+        // 拆，字段不参与判定），演员库才出数据。
         var info = const ActressLibraryVersionInfo();
         try {
           info = (await checkActressDbFileVersion(dbPath)).info;

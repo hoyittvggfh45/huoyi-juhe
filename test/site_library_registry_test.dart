@@ -205,6 +205,7 @@ void main() {
   tearDown(() {
     registry.debugSqlStationsOverride = null;
     registry.debugSqlImportedOverride = null;
+    registry.debugSqlBundledOverride = null;
     registry.debugGatedNativeOverride = null;
   });
 
@@ -255,6 +256,37 @@ void main() {
     expect(yt.extra['extPath'], '/tmp/sql/youtube3.json');
 
     expect(byId.containsKey('hongguo'), isFalse);
+  });
+
+  test('buildSqlSiteEntries：bundled 时每行带 bundled 标记，默认不带', () {
+    final plain = buildSqlSiteEntries(fakeStations);
+    for (final e in plain) {
+      expect(e.extra.containsKey('bundled'), isFalse, reason: e.id);
+    }
+    final bundled = buildSqlSiteEntries(fakeStations, bundled: true);
+    expect(bundled, hasLength(4));
+    for (final e in bundled) {
+      expect(e.extra['bundled'], isTrue, reason: e.id);
+      // builtin 不动（打包标记与 builtin 是两回事）。
+      expect(e.extra['builtin'], isFalse, reason: e.id);
+    }
+  });
+
+  test('syncSqlSites：打包装载时 SQL 行带 bundled 标记', () async {
+    registry.debugSqlStationsOverride = fakeStations;
+    registry.debugSqlImportedOverride = true;
+    registry.debugSqlBundledOverride = true;
+    await registry.syncSqlSites();
+    final py = registry.customById('seed_missav')!;
+    expect(py.extra['sqlManaged'], isTrue);
+    expect(py.extra['bundled'], isTrue);
+    // 关掉打包标记再对账：标记被撤（extra 变化触发重写）。
+    registry.debugSqlBundledOverride = false;
+    await registry.syncSqlSites();
+    expect(
+      registry.customById('seed_missav')!.extra.containsKey('bundled'),
+      isFalse,
+    );
   });
 
   test('syncSqlSites：导入建 SQL 行、未导入全撤，用户行不动', () async {

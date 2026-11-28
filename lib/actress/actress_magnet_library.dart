@@ -345,6 +345,33 @@ class ActressMagnetLibraryStore {
     final libraryName = name ?? magnetLibraryNameOfFile(sourceName);
     await target.execute('ATTACH DATABASE ? AS mstage', [stagingPath]);
     try {
+      // 护栏（2026-11-28 取消激活批 C2）：staging 自报全量
+      // 女优库形态（schema_meta 的 format='actress_library')
+      // → 这是完整女优库文件、不是磁力增量，整单中止、目标
+      // 库一字不动，提示走女优库导入。合并库（女优全量＋磁
+      // 力线路）正是这个形态：旧实现把它按磁力并入，只并 6
+      // 张标准表、其余表全丢，工作库被残化（诊断 §2）。
+      if (await _tableExists(target, 'schema_meta', schema: 'mstage.')) {
+        try {
+          final metaRows = await target.rawQuery(
+            "SELECT value FROM mstage.schema_meta "
+            "WHERE key = 'format' LIMIT 1",
+          );
+          final format = metaRows.isEmpty
+              ? ''
+              : metaRows.first['value']?.toString() ?? '';
+          if (format.trim().toLowerCase() == 'actress_library') {
+            return const MagnetImportOutcome(
+              ok: false,
+              error: '这个文件是完整的女优库数据库（作品、分类都在里面），'
+                  '不能当磁力库合并；请用「导入数据库」走女优库导入',
+            );
+          }
+        } catch (_) {
+          // schema_meta 形态异常（没 key/value 列等）：护栏查
+          // 不清就不拦，往下走原有两道尺判定。
+        }
+      }
       // 先验：临时库里得有磁力线路，否则这不是磁力分类库，
       // 整库文件走「导入数据库」的替换路，别在这里并掉。
       final magnetCount = await _magnetUrlCount(target, schema: 'mstage.');
@@ -529,6 +556,14 @@ class ActressMagnetLibraryStore {
             'SELECT vod_id, tag_name FROM mstage.video_tag',
           );
         }
+        // 保全合并（2026-11-28 取消激活批 C2）：标准 6 表之
+        // 外，staging 与目标库共有的表逐表并入，目标库独有
+        // 的表与数据原样保留；staging 有而目标库没有的表按
+        // staging 自己的建表语句补建再并入——绝不以子集库
+        // 换掉工作库（旧实现只并 6 表，index_categories /
+        // tags / video_ranking / actor_ranking / schema_meta
+        // 被整表丢弃，工作库残化，诊断 §2/§3）。
+        await _mergeRemainingTables(txn);
         var totalWorks = 0;
         var addedWorks = 0;
         var addedUrls = 0;
@@ -599,6 +634,89 @@ class ActressMagnetLibraryStore {
       [libraryId],
     );
     return (rows.first['c'] as num?)?.toInt() ?? 0;
+  }
+
+  /// 保全合并已由标准合并段与登记段处理的表：标准 6 表走
+  /// 各自的显式列清单、登记 5 表是目标库自己的账，都不进
+  /// [_mergeRemainingTables] 的通用并入。
+  static const _mergeHandledTables = <String>{
+    'videos',
+    'actresses',
+    'video_actress',
+    'video_play_urls',
+    'video_category',
+    'video_tag',
+    'magnet_libraries',
+    'magnet_library_works',
+    'magnet_library_play_urls',
+    'magnet_library_actresses',
+    'magnet_library_categories',
+  };
+
+  Future<List<String>> _tableNames(
+    DatabaseExecutor db, {
+    String schema = '',
+  }) async {
+    final rows = await db.rawQuery(
+      "SELECT name FROM ${schema}sqlite_master "
+      "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    );
+    return [for (final row in rows) row['name'].toString()];
+  }
+
+  Future<List<String>> _columnNames(
+    DatabaseExecutor db,
+    String table, {
+    String schema = '',
+  }) async {
+    final escaped = table.replaceAll("'", "''");
+    final rows = await db.rawQuery(
+      "PRAGMA ${schema}table_info('$escaped')",
+    );
+    return [for (final row in rows) row['name'].toString()];
+  }
+
+  static String _quotedIdent(String name) =>
+      '"${name.replaceAll('"', '""')}"';
+
+  /// 通用保全并入（mergeStaging 事务内、标准表并完后调）：
+  /// staging（mstage）里除 [_mergeHandledTables] 外的每张
+  /// 表——目标库已有同名表：按两边共有列 INSERT OR IGNORE
+  /// 逐行并入（目标行优先、一条不覆盖）；目标库没有：用
+  /// staging 在 sqlite_master 里存的建表语句原样补建（与女
+  /// 优库导入器落 staging 时同一份 DDL，即真库的完整建表
+  /// 口径）再整表并入。目标库独有的表本方法根本不碰。
+  Future<void> _mergeRemainingTables(Transaction txn) async {
+    final stagingTables = await _tableNames(txn, schema: 'mstage.');
+    final targetTables = (await _tableNames(txn)).toSet();
+    for (final table in stagingTables) {
+      if (_mergeHandledTables.contains(table)) continue;
+      final ident = _quotedIdent(table);
+      if (!targetTables.contains(table)) {
+        final ddlRows = await txn.rawQuery(
+          "SELECT sql FROM mstage.sqlite_master "
+          "WHERE type = 'table' AND name = ?",
+          [table],
+        );
+        final ddl = ddlRows.isEmpty
+            ? null
+            : ddlRows.first['sql']?.toString();
+        if (ddl == null || ddl.trim().isEmpty) continue;
+        await txn.execute(ddl);
+      }
+      final stagingCols = await _columnNames(txn, table, schema: 'mstage.');
+      final targetCols = (await _columnNames(txn, table)).toSet();
+      final common = [
+        for (final col in stagingCols)
+          if (targetCols.contains(col)) col,
+      ];
+      if (common.isEmpty) continue;
+      final colList = common.map(_quotedIdent).join(', ');
+      await txn.execute(
+        'INSERT OR IGNORE INTO $ident ($colList) '
+        'SELECT $colList FROM mstage.$ident',
+      );
+    }
   }
 
   /// 删除一个已导入的磁力分类库（语义见文件头）：独有作品
@@ -1028,9 +1146,7 @@ Future<MagnetStagingOutcome> buildMagnetStagingDb(
     // 字段，它的校验走磁力自己的两道尺（stagingIsMagnetLibrary
     // 与合并内兜底）。这里只借导入器落 staging 的能力，版本门
     // 传放行件，免得磁力 .sql 被女优库的门误拒。
-    final result = await (importer ??
-            ActressSqlImporter(versionGate: (_) async => null))
-        .importFile(
+    final result = await (importer ?? ActressSqlImporter()).importFile(
       sqlPath: sourcePath,
       dbPath: stagingPath,
       closeDatabase: () async {},

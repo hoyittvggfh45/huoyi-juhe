@@ -32,6 +32,14 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
 
   Chapter get _chapter => widget.chapters[_index];
 
+  bool _isRemoteFullPilotChapter(Chapter chapter) =>
+      widget.chapterLoader == null &&
+      !widget.localOnly &&
+      widget.chapterCache == null &&
+      !ImportedBookStore.isLocalBookId(widget.bookId) &&
+      !widget.bookId.startsWith('shuqi:') &&
+      ApiClient.instance.usesRemoteFullChapter(widget.bookId);
+
   ChapterCache get _diskCache =>
       widget.chapterCache ?? ChapterCacheStore.instance;
   CachedBook get _cachedBook => CachedBook(
@@ -83,7 +91,9 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       }
       if (!mounted || generation != _loadGeneration) return;
       // Cache updates may arrive while preferences/history are being read.
-      final text = _chapterCache[chapter.itemId] ?? loaded.text;
+      final text = _isRemoteFullPilotChapter(chapter)
+          ? loaded.text
+          : _chapterCache[chapter.itemId] ?? loaded.text;
       final content = ChapterContent.fromCacheText(text);
       if (content.withoutLeadingTitle(chapter.title).isEmpty) {
         throw const ApiException('本章暂无可显示正文，可切换下一章或从目录选择其他章节');
@@ -137,10 +147,15 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
 
   Future<_LoadedChapter> _chapterText(Chapter chapter) async {
     final id = chapter.itemId;
-    final cached = _chapterCache.remove(id);
-    if (cached != null) {
-      _chapterCache[id] = cached;
-      return (text: cached, fetched: false);
+    // Remote-first chapters never serve the memory cache: the remote source
+    // must get its chance before any local copy (user routing rule,
+    // 2026-11-28: upstream remote first, local official-direct fallback).
+    if (!_isRemoteFullPilotChapter(chapter)) {
+      final cached = _chapterCache.remove(id);
+      if (cached != null) {
+        _chapterCache[id] = cached;
+        return (text: cached, fetched: false);
+      }
     }
     final pending = _chapterRequests[id];
     if (pending != null) return pending;
@@ -156,18 +171,54 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
     }
   }
 
+  /// Remote-first fetch for pilot chapters (user routing rule, 2026-11-28).
+  ///
+  /// Upstream's A3 pilot deliberately lets remote failures escape so pilot
+  /// telemetry stays clean; Fanren overrides that: any remote failure -
+  /// unreachable, timeout, business error, decrypt failure, or an empty
+  /// body - falls back to the local Fanqie official-direct path
+  /// ([ApiClient.chapterContent]) so the reader never dead-ends on a
+  /// remote outage. Every outcome is logged under `source-route` so a
+  /// phone-side report shows which backend actually served the chapter.
+  Future<ChapterContent> _fetchRemoteFirstChapter(Chapter chapter) async {
+    // The remote-first/local-fallback switch lives in
+    // [ApiClient.remoteFirstFullChapterContent] so it is unit-testable;
+    // only the cancellation-handle bookkeeping for the local fetch stays
+    // here, inside the localFetch closure.
+    return ApiClient.instance.remoteFirstFullChapterContent(
+      widget.bookId,
+      chapter.itemId,
+      chapterTitle: chapter.title,
+      localFetch: () async {
+        final request = _chapterRequestHandles.start(chapter.itemId);
+        try {
+          return await ApiClient.instance.withCancellation(
+            request,
+            () => ApiClient.instance.chapterContent(chapter.itemId),
+          );
+        } finally {
+          _chapterRequestHandles.finish(chapter.itemId, request);
+        }
+      },
+    );
+  }
+
   Future<String> _fetchChapter(Chapter chapter) async {
     final loader = widget.chapterLoader;
     final ChapterContent content;
     if (loader == null) {
-      final request = _chapterRequestHandles.start(chapter.itemId);
-      try {
-        content = await ApiClient.instance.withCancellation(
-          request,
-          () => ApiClient.instance.chapterContent(chapter.itemId),
-        );
-      } finally {
-        _chapterRequestHandles.finish(chapter.itemId, request);
+      if (_isRemoteFullPilotChapter(chapter)) {
+        content = await _fetchRemoteFirstChapter(chapter);
+      } else {
+        final request = _chapterRequestHandles.start(chapter.itemId);
+        try {
+          content = await ApiClient.instance.withCancellation(
+            request,
+            () => ApiClient.instance.chapterContent(chapter.itemId),
+          );
+        } finally {
+          _chapterRequestHandles.finish(chapter.itemId, request);
+        }
       }
     } else {
       final text = await loader(chapter);
@@ -330,7 +381,10 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
     bool superseded() =>
         revision != (_chapterCacheRevisions[chapter.itemId] ?? 0);
     String? text;
-    if (!widget.localOnly) {
+    // Remote-first chapters skip the disk cache read as well: a stale local
+    // copy must not preempt the remote source (the fetch falls back to the
+    // local official-direct path on any remote failure).
+    if (!widget.localOnly && !_isRemoteFullPilotChapter(chapter)) {
       try {
         final cached = await _diskCache.read(
           bookId: widget.bookId,
@@ -357,7 +411,9 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
         rethrow;
       }
       if (superseded()) return _latestChapterText(chapter);
-      if (mounted && !widget.localOnly) {
+      // Pilot fetches are not persisted to the disk cache (upstream A3
+      // semantics): the next open re-runs remote-first routing.
+      if (mounted && !widget.localOnly && !_isRemoteFullPilotChapter(chapter)) {
         try {
           await _ensureCatalog();
           if (superseded()) return await _latestChapterText(chapter);
@@ -375,7 +431,9 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       }
     }
     if (superseded()) return _latestChapterText(chapter);
-    if (mounted) _rememberChapter(chapter.itemId, text);
+    if (mounted && !_isRemoteFullPilotChapter(chapter)) {
+      _rememberChapter(chapter.itemId, text);
+    }
     return (text: text, fetched: fetched);
   }
 
@@ -387,6 +445,7 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
   }
 
   Future<void> _prefetchAround(int index) async {
+    if (_isRemoteFullPilotChapter(_chapter)) return;
     final nearby = <Chapter>[
       if (index > 0) widget.chapters[index - 1],
       if (index + 1 < widget.chapters.length) widget.chapters[index + 1],

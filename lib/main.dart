@@ -6,6 +6,7 @@ import 'services/desktop_platform.dart';
 import 'services/drama_site_content.dart';
 import 'services/drama_sites.dart';
 import 'services/web_page_fetch.dart';
+import 'services/net_resilience.dart';
 import 'services/platform_channel.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -34,6 +35,7 @@ import 'actress/actress_library_native_page.dart';
 import 'actress/actress_adapter_repository.dart';
 import 'actress/actress_adapter_store.dart';
 import 'actress/actress_mytv_bind.dart';
+import 'actress/import_job_service.dart';
 import 'pages/bottom_nav_manage_page.dart';
 import 'services/app_log.dart';
 import 'services/bottom_nav_prefs.dart';
@@ -57,6 +59,7 @@ import 'services/cultivation.dart';
 import 'services/game_service.dart';
 import 'services/rank_cache.dart';
 import 'services/player_style_config.dart';
+import 'services/site_library.dart';
 import 'services/source_registry.dart';
 import 'services/idj_plugin_store.dart';
 import 'services/idj_runtime.dart';
@@ -65,6 +68,8 @@ import 'services/zakatv_builtin.dart';
 import 'services/short_series_font_scale.dart';
 import 'services/playlet_share.dart';
 import 'services/poster_cache.dart';
+import 'services/api_client.dart';
+import 'services/source_policy_controller.dart';
 import 'services/shelf_store.dart';
 import 'services/swipe_guide_store.dart';
 import 'services/local_media_proxy.dart';
@@ -91,6 +96,10 @@ Future<void> main() async {
     } catch (error, stack) {
       AppLog.e('main', '启动装配失败，继续挂载界面', error: error, stack: stack);
     }
+    // 后台导入未完成识别（2026-11-28 批）：残留「导入进行中」
+    // 标记＝上次导入被系统中断，服务据此清 staging 并置中断态，
+    // 管理页会给中文提示。fail-soft，不挡启动。
+    unawaited(ImportJobService.instance.ensureStartupChecked());
     runApp(const ProviderScope(child: FqApp()));
   }, (error, stack) => AppLog.e('zone', '未捕获异步异常', error: error, stack: stack));
 }
@@ -213,6 +222,19 @@ Future<void> _initializeLocalData() async {
   // （9978 起找空闲端口），关着就不起；/proxy 的 do/siteKey 分发同
   // 时接线。失败只退化为「本次启动不常驻」，播放时按需再起，不挡启动。
   bindLocalProxyRoutes();
+  // 网络容灾（GitHub 镜像回退 + DoH）：开关默认开、先读盘再装全局
+  // HttpOverrides，让全应用 Dart 侧 HttpClient（含 package:http 与
+  // 图片缓存管理器）在系统 DNS 失败/被污染时自动走加密 DNS 解析。
+  // 覆盖不到的三条如实记账：Rust 核心解析在 Rust 侧、播放器原生
+  // 取流、WebView 内核解析，都不在 Dart HttpClient 这层。
+  unawaited(() async {
+    try {
+      await NetResiliencePreferences.instance.load();
+      HttpOverrides.global = ResilientHttpOverrides();
+    } catch (error, stack) {
+      AppLog.w('startup', '网络容灾初始化失败，本次启动不启用', error: error, stack: stack);
+    }
+  }());
   unawaited(() async {
     try {
       await LocalProxyPreferences.instance.load();
@@ -228,11 +250,15 @@ Future<void> _initializeLocalData() async {
       );
     }
   }());
-  // 站点库对账：旧的 ensureBuiltinJarSites()/ensureBuiltinImportedSites()
-  // 启动调用已解除（方法本体保留，瘦身阶段总管处置）——内置种子/jar
-  // 行改由站点库导入激活，未导入时只有名单。registry load 末尾已调
-  // 一次 syncSqlSites，这里保留一次冗余对账兜底。
-  unawaited(SourceRegistry.instance.syncSqlSites());
+  // 站点库：站点已随包内置（2026-11-28 取消激活令）——先静默
+  // 装载打包站点库（资产内容戳判重、fail-soft 不挡启动），装
+  // 载完再对账登记行；顺序串好，避免对账跑在装载前面白跑。
+  // 旧的 ensureBuiltinJarSites()/ensureBuiltinImportedSites()
+  // 启动调用仍保持解除（种子/jar 行由站点库行取代）。
+  unawaited(() async {
+    await SiteLibraryService.instance.ensureBundledSiteLibraryLoaded();
+    await SourceRegistry.instance.syncSqlSites();
+  }());
   // 内置 jar 启动时校验一次落盘：覆盖安装后指纹变了就重解，避免用户
   // 第一次点站才解包、还撞上并发（见 jar_bridge 的竞态修复说明）。
   // 尽力而为，不挡启动；已落盘且指纹对得上时只是两次 MD5 读盘。
@@ -294,6 +320,7 @@ Future<void> _initializeLocalData() async {
   // 否则广播到达时 Dart 侧还没有处理函数，原生侧只能按“未处理”回。
   FairMemoryService.instance.init();
   final sp = await SharedPreferences.getInstance();
+  _startSourcePolicy(sp);
   // Note: Optional preference schemas cannot block local data startup; see
   // .agents/notes/implemented/bug-fix/2026-09-17-persistent-data-and-web-cancellation.md.
   final savedTheme = sp.get(themeModeKey);
@@ -319,6 +346,24 @@ Future<void> _initializeLocalData() async {
   // 短剧分区上次停在哪个频道（官方 SP `last_tab_type`）：同样只读一次，
   // 页面在 initState 同步取用，首帧不会先闪「推荐」。
   DramaChannelPreferences.load(sp);
+}
+
+SourcePolicyController? _sourcePolicyController;
+
+/// Starts the A5 runtime policy once. Bootstrap retries reuse the same
+/// controller so the lifecycle observer is never registered twice.
+void _startSourcePolicy(SharedPreferences preferences) {
+  final existing = _sourcePolicyController;
+  if (existing != null) {
+    existing.start();
+    return;
+  }
+  final controller = SourcePolicyController(
+    api: ApiClient.instance,
+    preferences: preferences,
+  );
+  _sourcePolicyController = controller;
+  controller.start();
 }
 
 class FqApp extends StatefulWidget {

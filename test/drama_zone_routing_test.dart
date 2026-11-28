@@ -270,12 +270,15 @@ void main() {
     } finally {
       cultivationAdultTierGateDisabledForTesting = wasDisabled;
     }
-    expect(adultTierForSiteId('seed_xojav', adultVideoSiteOrder), 1);
+    // xojav 下标 88：2026-11-28 对齐补齐后总数 377，
+    // 88*4~/377 = 0（第 1 档），较 281 站时的第 2 档提前一档。
+    expect(adultTierForSiteId('seed_xojav', adultVideoSiteOrder), 0);
     expect(adultTierForSiteId('seed_porncgw', adultVideoSiteOrder), 1);
-    // x51 下标 190：201 站时 190*4~/201 = 3（第 4 档）；资源站追加与
-    // 魔蚁 v63 合入后总数 278，190*4~/278 = 2（第 3 档），解锁从合体
-    // 30000 提前到炼虚 15000——公式本意，不是分档真错。
-    expect(adultTierForSiteId('seed_x51', adultVideoSiteOrder), 2);
+    // x51 下标 187：201 站时 187*4~/201 = 3（第 4 档）；资源站追加与
+    // 魔蚁 v63 合入后总数 278 时为第 3 档；2026-11-28 对齐补齐后
+    // 总数 377，187*4~/377 = 1（第 2 档），解锁从炼虚 15000 提前到
+    // 化神 8000——公式本意，不是分档真错。
+    expect(adultTierForSiteId('seed_x51', adultVideoSiteOrder), 1);
     expect(adultTierForSiteId('hddj', adultVideoSiteOrder), 0);
     // hgdj 是期望过时、不是分档真错：登记表里 hgdj 下标 100、总数
     // 201，100*4~/201 = 1（第 2 档）。AOXX69 摘站后总数 202→201，

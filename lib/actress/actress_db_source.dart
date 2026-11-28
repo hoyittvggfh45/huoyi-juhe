@@ -37,9 +37,16 @@ import 'actress_mytv_bind.dart';
 ///   由导入服务调 [markActivated] 落一条激活记录才生效。
 /// - 外置槽**不再直通**：MYTV/db/女优库.db 放着不生效，它只是
 ///   管理页里看得见的「导入来源」，不点导入永远不激活。
-/// - 没激活（或已激活但导入库文件没了）→ 生效路径为空，演员
-///   库只有未激活空态＋导入引导，全局搜索的演员库段同样不出
-///   （读库层拿不到路径即静默，与「没库静默」同口径）。
+/// - **生效必须过结构探针（2026-11-28 取消激活批 C3）**：有
+///   激活记录＋导入库文件在还不够，作品探针（复用计数探针，
+///   按文件戳缓存）数得出作品数 >0 才算生效；文件在但探针
+///   不过（残库/空壳/打不开）视为未生效，转探外置兜底。
+///   legacy 存量补记机制不变，但「文件存在」不再单独决定
+///   生效。
+/// - 没激活（或已激活但导入库文件没了/探针不过且无兜底）→
+///   生效路径为空，演员库只有未激活空态＋导入引导，全局搜
+///   索的演员库段同样不出（读库层拿不到路径即静默，与「没
+///   库静默」同口径）。
 /// - **外置兜底（2026-11-28 11:18 用户令「导入失败就使用外置
 ///   db兜底」）**：未激活（导入失败或尚无可用导入库）时，只要
 ///   外置 MYTV/db/女优库.db 存在且结构探针过关（认得出作品表
@@ -89,12 +96,13 @@ class ActressDbActivation {
 
   bool get isLegacy => origin == 'legacy';
 
-  /// 管理页展示用一句话。核心版本不再显示（2026-11-28 用户
-  /// 令：管理页不出现「要求核心」；coreVersion 字段只留痕）。
+  /// 管理页展示用一句话。去版本化（2026-11-28 用户令「数据
+  /// 库版本彻底取消」）：不出现「库版本/格式」字样，只说人
+  /// 话；版本字段本身保留在记录与 JSON 里兼容存量，不参与
+  /// 判定、也不显示。
   String get describe {
-    if (isLegacy) return '存量库（升级前已在用，无版本字段，继续可用）';
-    return '库版本 ${libraryVersion.isEmpty ? '未知' : libraryVersion}'
-        ' · 格式 $formatVersion';
+    if (isLegacy) return '存量库（升级前已在用，继续可用）';
+    return '已导入';
   }
 
   Map<String, Object?> toJson() => {
@@ -202,7 +210,8 @@ class ActressDbSourceStatus {
   /// 当前激活记录（未激活为 null；含存量过渡的 legacy 记录）。
   final ActressDbActivation? activation;
 
-  /// 演员库是否已激活（有记录且导入库文件在）。
+  /// 演员库是否已激活：[ActressDbSource.status] 只在导入库
+  /// 过了结构探针时才带回激活记录，故有记录＋文件在即生效。
   bool get activated => activation != null && imported.exists;
 
   /// 有没有可用数据（已激活或兜底中）。
@@ -404,12 +413,20 @@ class ActressDbSource {
         // 补记落盘失败不挡本次生效：内存里的记录先用着。
       }
     }
-    final activated = activation != null && importedInfo.exists;
-    // 外置兜底：未激活且外置库在、结构探针过关 → 外置库只读
-    // 生效。探针结果按文件戳缓存，避免每次解析都开一次库。
+    // 生效判定必须过结构探针（2026-11-28 取消激活批 C3）：
+    // 有激活记录、导入库文件在，还得作品探针数得出作品
+    // （>0）才算真生效。旧实现「文件存在即激活」让磁力误
+    // 导留下的残库/空壳把外置兜底永久短路（诊断 §4）；现
+    // 在探针不过 → 视为未生效，落到下面的外置兜底探针。
+    var activated = false;
+    if (activation != null && importedInfo.exists) {
+      activated = await _probeStructure(importedInfo);
+    }
+    // 外置兜底：未生效且外置库在、结构探针过关 → 外置库只
+    // 读生效。探针结果按文件戳缓存，避免每次解析都开库。
     var fallback = false;
     if (!activated && externalInfo.exists) {
-      fallback = await _probeExternalStructure(externalInfo);
+      fallback = await _probeStructure(externalInfo);
     }
     return ActressDbSourceStatus(
       selection: selection,
@@ -427,19 +444,21 @@ class ActressDbSource {
     );
   }
 
-  String? _fallbackProbeStamp;
-  bool _fallbackProbeOk = false;
+  /// 结构探针结果缓存：键是「路径|大小|修改时间」文件戳，
+  /// 导入槽与外置槽共用（两槽路径不同、戳不相撞）。
+  final Map<String, bool> _probeCache = {};
 
-  /// 外置库结构探针（兜底门）：复用作品数探针——只读开库，
-  /// 认得出作品表且作品数 >0 才算结构过关（与 .db 导入的
-  /// 结构校验同口径：有 videos 表或通用作品表）。版本字段
-  /// 完全不看（兜底按存量库处理）。结果按「路径|大小|修改
-  /// 时间」缓存，外置文件没变就不重复开库。
-  Future<bool> _probeExternalStructure(ActressDbSlotInfo info) async {
+  /// 库结构探针（生效门与兜底门共用）：复用作品数探针——
+  /// 只读开库，认得出作品表且作品数 >0 才算结构过关（与
+  /// .db 导入的结构校验同口径：有 videos 表或通用作品
+  /// 表）。版本字段完全不看。文件打不开/无作品表/作品数为
+  /// 0 一律不过。结果按文件戳缓存，文件没变不重复开库。
+  Future<bool> _probeStructure(ActressDbSlotInfo info) async {
     final stamp =
         '${info.dbPath}|${info.sizeBytes}|'
         '${info.modified?.millisecondsSinceEpoch ?? 0}';
-    if (_fallbackProbeStamp == stamp) return _fallbackProbeOk;
+    final cached = _probeCache[stamp];
+    if (cached != null) return cached;
     var ok = false;
     try {
       final works = await _worksCounter(info.dbPath);
@@ -447,8 +466,7 @@ class ActressDbSource {
     } catch (_) {
       ok = false;
     }
-    _fallbackProbeStamp = stamp;
-    _fallbackProbeOk = ok;
+    _probeCache[stamp] = ok;
     return ok;
   }
 

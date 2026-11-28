@@ -4,9 +4,17 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../actress/actress_adapter_models.dart' show AppFailure;
+import '../actress/actress_adapter_player.dart' show pushPlayer;
+import '../actress/actress_adapter_repository.dart' show XiuxianAppRepository;
+import '../actress/actress_adapter_store.dart' show LocalStore;
+import '../actress/actress_crosssite_probe.dart'
+    show CrossSiteLine, CrossSiteRowPlan, CrossSiteVersion, planCrossSiteRows;
+import '../actress/actress_javdb_api.dart' show JavdbApiClient;
 import '../actress/actress_widgets.dart';
 import '../actress/code_meta_section.dart';
 import '../actress/jav_code_meta.dart';
+import '../actress/javdb_detail_sections.dart';
 import '../models/media_item.dart';
 import '../models/playlet_comment.dart';
 import '../models/series_detail.dart'
@@ -98,6 +106,7 @@ class SeriesDetailPage extends StatefulWidget {
     this.filmFillLoader,
     this.engineSiteId = '',
     this.shelfKind = 'video',
+    this.javdbClient,
   });
 
   final String seriesId;
@@ -190,6 +199,9 @@ class SeriesDetailPage extends StatefulWidget {
   final Future<FilmDetailFill> Function(String code, CodeMeta? meta)?
   filmFillLoader;
 
+  /// JavDB 三件用的客户端（测试/预览注入缝）；为空时页面现建一个。
+  final JavdbApiClient? javdbClient;
+
   @override
   State<SeriesDetailPage> createState() => _SeriesDetailPageState();
 }
@@ -274,6 +286,9 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
 
   /// 影视区内联播放器的键：选集切集与全屏都经它调播放器。
   final _inlinePlayerKey = GlobalKey<FilmInlinePlayerState>();
+
+  /// JavDB 三件客户端：注入优先，否则现建（本页此前没有现成实例）。
+  late final JavdbApiClient _javdb = widget.javdbClient ?? JavdbApiClient();
 
   @override
   void initState() {
@@ -1219,6 +1234,79 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
     onRetry: () => unawaited(_loadDetail()),
   );
 
+  /// JavDB 在线播放页签的线路起播：走 App 既有播放链
+  /// （pushPlayer → PlayerPage，取流走仓储 resolve）。仓储与
+  /// store 本页没有现成字段，照 main.dart / search_page.dart 里
+  /// pushPlayer 调用方的同法取共享单例（XiuxianAppRepository.shared
+  /// + LocalStore.instance）。AppFailure 的 message 已是中文，直接提示。
+  Future<void> _playJavdbOnlineLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    final error = await _tryPushJavdbOnlineLine(version, line);
+    if (error == null || !mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  /// 页签线路起播本体：成功回 null，失败回中文原因（手点由
+  /// 调用方提示，自动播静默换下一行）。搜到的线路经
+  /// pushPlayer 进 PlayerPage 即是本页的真线路（播放页内可
+  /// 切线），不另建线路池——本页线路体系就是本站剧集 + 播
+  /// 放页，归属不冲突（火蚁对账③）。
+  Future<String?> _tryPushJavdbOnlineLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async {
+    try {
+      await pushPlayer<void>(
+        context,
+        detail: version.detail,
+        initialIndex: line.episodeIndex,
+        repository: XiuxianAppRepository.shared,
+        store: LocalStore.instance,
+      );
+      return null;
+    } on AppFailure catch (error) {
+      return error.message;
+    }
+  }
+
+  /// JavDB 页签自动播：本页内嵌播放器只吃本站剧集、无外部
+  /// 线路入口，自动播走 pushPlayer 开播放页（形态与演员页
+  /// 不同，2026-11-28 已报用户知悉）。本页数据库只带磁力
+  /// （复制用、既有口径不在本页接播放链），没有可让路的数
+  /// 据库播放线路，新令 6 的数据库优先在本页无对象，自动播
+  /// 不压住。
+  Future<bool> _autoPlayJavdbOnlineLine(
+    CrossSiteVersion version,
+    CrossSiteLine line,
+  ) async => await _tryPushJavdbOnlineLine(version, line) == null;
+
+  /// 本地站探活计划（JavDB 在线页签用）：用共享 LocalStore
+  /// 现算 planCrossSiteRows（当前站以 engineSiteId 剔除），
+  /// 页面生命周期内只算一次；站表读不到回空表（页签只剩
+  /// 固定六家），不挡页签主链。
+  List<CrossSiteRowPlan>? _javdbLocalPlans;
+
+  List<CrossSiteRowPlan> get _localPlansForJavdbSections {
+    final cached = _javdbLocalPlans;
+    if (cached != null) return cached;
+    List<CrossSiteRowPlan> plans;
+    try {
+      final store = LocalStore.instance;
+      plans = planCrossSiteRows(
+        sites: store.visibleSources,
+        siteVisible: store.siteVisible,
+        currentSourceId: widget.engineSiteId,
+      );
+    } catch (_) {
+      plans = const [];
+    }
+    return _javdbLocalPlans = plans;
+  }
+
   /// 影视区简介：简介与演员都走站详情（`synopsis` / `actor` 原字段），
   /// 复用短剧简介区同一套展开 / 演员横排版式。站详情没回来时整块不画，
   /// 只有真的请求失败才给区块内重试。
@@ -1364,6 +1452,21 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
             // 选集与简介复用现有区（自带左右 16 间距，与上面对齐）。
             _episodeSection(),
             _filmIntroSection(),
+            // JavDB 三件（评论/相关清单/在线播放）：只挂影视布局
+            // （_filmMoyiDetail，磁力区所在的那套；短剧布局不走
+            // 这里），且只在有番号时挂——无番号作品整块不出现。
+            if (javdbSectionsVisibleFor(_filmCode))
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: JavdbDetailSections(
+                  code: _filmCode,
+                  client: _javdb,
+                  repository: XiuxianAppRepository.shared,
+                  onPlayLine: _playJavdbOnlineLine,
+                  localPlans: _localPlansForJavdbSections,
+                  onAutoPlayLine: _autoPlayJavdbOnlineLine,
+                ),
+              ),
             _filmFillEmptyNote(),
           ],
         ),

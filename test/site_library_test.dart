@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/live_sources.dart';
 import 'package:fqapp/services/site_library.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// 按规格口径独立算 payload（不调生产函数）：parts 拼串、UTF-8
 /// 字节序排序、'\n' 连接、sha256 hex。生产函数若拼串/排序口径
@@ -332,11 +334,12 @@ void main() {
       );
     });
 
-    test('格式版本不符拒收（签名按该版本正算，死在版本门）', () async {
+    test('格式版本不符照常导入（2026-11-28 拆版本门；签名按该版本正算、验签照过）', () async {
       final outcome = await runImport(_LibFixture(formatVersion: '2'));
-      expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('格式版本 2'));
-      expect(outcome.error, contains('支持的 1'));
+      expect(outcome.ok, isTrue, reason: outcome.error);
+      expect(outcome.stationCount, 2);
+      final dbPath = '${tempDir.path}/site_library.db';
+      expect(await File(dbPath).readAsString(), 'NEWDB');
     });
 
     test('核心版本任意值照常放行（2026-11-28 取消核心门）', () async {
@@ -418,6 +421,16 @@ void main() {
       expect(channels.single.title, '台一');
     });
 
+    test('落盘库格式版本任意值：照常激活（2026-11-28 拆版本门）', () async {
+      final dbFile = File('${libDir.path}/site_library.db');
+      await dbFile.writeAsString('DB');
+      final service = makeService(_LibFixture(formatVersion: '2'));
+      await service.load();
+      expect(service.imported, isTrue);
+      expect(service.loadRejectionReason, isNull);
+      expect(service.stations, hasLength(2));
+    });
+
     test('落盘库核心版本任意值：照常激活（2026-11-28 取消核心门）', () async {
       final dbFile = File('${libDir.path}/site_library.db');
       await dbFile.writeAsString('DB');
@@ -465,6 +478,66 @@ void main() {
       expect(service.imported, isTrue);
       expect(service.stations, hasLength(2));
       expect(LiveSources.sqlSources, hasLength(1));
+    });
+  });
+
+  group('打包站点库首启静默装载（小夹具资产）', () {
+    late Directory root;
+
+    setUp(() {
+      SharedPreferences.setMockInitialValues({});
+      root = Directory.systemTemp.createTempSync('site_bundled_');
+      LiveSources.sqlSources = [];
+    });
+    tearDown(() {
+      LiveSources.sqlSources = [];
+      if (root.existsSync()) root.deleteSync(recursive: true);
+    });
+
+    test('首次装载落盘并记戳；戳一致时不再重导', () async {
+      final fixture = _LibFixture();
+      var importRuns = 0;
+      Future<SiteLibrarySqlExecutor> countingFactory(String tempPath) async {
+        importRuns++;
+        return _factoryFor(_FakeExecutor(fixture))(tempPath);
+      }
+      final gzBytes = gzip.encode(
+        utf8.encode('CREATE TABLE stations(site_id TEXT);\n'),
+      );
+      final service = SiteLibraryService(
+        supportDirectoryProvider: () async => root,
+        readExecutorFactory: (_) async => _FakeExecutor(fixture),
+        assetLoader: (_) async => '[]',
+        importer: SiteLibraryImporter(executorFactory: countingFactory),
+        assetBytesLoader: (_) async =>
+            ByteData.view(Uint8List.fromList(gzBytes).buffer),
+      );
+      expect(service.isBundledLoad, isFalse);
+      await service.ensureBundledSiteLibraryLoaded();
+      expect(service.imported, isTrue);
+      expect(service.isBundledLoad, isTrue);
+      expect(importRuns, 1);
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getString('site_library_bundled_asset_sha256_v1'),
+        sha256.convert(gzBytes).toString(),
+      );
+      // 第二次：戳一致 + 库文件在 → 只读回，不再走导入路。
+      await service.ensureBundledSiteLibraryLoaded();
+      expect(importRuns, 1);
+      expect(service.isBundledLoad, isTrue);
+    });
+
+    test('资产读不到：fail-soft 不抛、保持未装载', () async {
+      final service = SiteLibraryService(
+        supportDirectoryProvider: () async => root,
+        readExecutorFactory: (_) async => _FakeExecutor(_LibFixture()),
+        assetLoader: (_) async => '[]',
+        assetBytesLoader: (_) async => throw StateError('no asset'),
+      );
+      await service.ensureBundledSiteLibraryLoaded();
+      expect(service.imported, isFalse);
+      expect(service.isBundledLoad, isFalse);
     });
   });
 }

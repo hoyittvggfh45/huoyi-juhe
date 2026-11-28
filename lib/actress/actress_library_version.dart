@@ -4,44 +4,25 @@ import 'package:sqflite/sqflite.dart';
 
 import 'actress_database.dart' show applyActressDbReadPragmas;
 
-/// 女优库版本门（2026-11-27 演员库激活批）：女优库不再是文件放对
-/// 位置就生效，必须走导入激活；导入先查库里的版本字段，对不上
-/// 不激活。字段规格与站点库（lib/services/site_library.dart）钉死
-/// 同款，不发明第二套：
+/// 女优库版本字段读取（留痕用）：库内 `schema_meta` 表（key/value）
+/// 里的 `format` / `format_version` / `core_version` /
+/// `library_version` 四个字段，导入成功后回读出来随激活记录存
+/// 一份备查，仅此而已。
 ///
-/// - 版本字段住在库内 `schema_meta` 表（key/value）：
-///   `format`（女优库恒为 `actress_library`）、`format_version`
-///   （库格式版本）、`core_version`（本库自报的核心版本）、
-///   `library_version`（库自身版本，仅展示/留痕，不参与比对）；
-/// - 比对口径：format_version 必须等于
-///   [actressLibrarySupportedFormatVersion]（可注入覆盖，测试/
-///   将来升版用）；
-/// - **核心版本不设门（2026-11-28 13:25 用户令「取消这个」）**：
-///   core_version 带不带、写什么值，都不许据此拒收——它只作
-///   记录随激活信息留痕，不参与任何比对；管理页也不再显示
-///   「要求核心」。结构校验（表在不在、作品数）照旧，结构真
-///   坏了才拒；
-/// - 缺版本字段（无 schema_meta / format 不对 / 缺
-///   format_version）、格式版本对不上，仍拒收并给中文原因，
-///   已激活的旧库一字不动（调用方保证）。外置库纯缺字段的存
-///   量放行口径不变（见 actress_db_import.dart）。
-///
-/// 存量口径（同批定版）：版本门只管**新导入**。升级前导入槽里
-/// 已经在用的库（没有版本字段）视为存量继续可用，激活记录记
-/// origin=legacy，见 actress_db_source.dart。
+/// **数据库版本门已全拆（2026-11-28 用户令：取消整套激活方案、
+/// 数据库版本彻底取消）**：format_version 缺失、写任意值，都
+/// 不再据此拒收或比对；本文件不再有任何判定函数。导入收不收
+/// 只看结构完整性（表/列缺失、文件打不开、作品数等），在各
+/// 导入链自己的校验段里把关。版本字段仍是文件格式的一部分
+/// （双边通用口径），读到什么记什么、读不到记空，不参与判定、
+/// 不上屏显示。
 
-/// 本软件支持的女优库格式版本（schema_meta.format_version 必须
-/// 等于它）。
-const actressLibrarySupportedFormatVersion = '1';
-
-/// 本软件的核心版本（仅留痕：写进激活记录备查，2026-11-28 起
-/// 不再参与任何版本比对，见文件头）。
-const actressLibraryDefaultCoreVersion = '2026.11.27';
-
-/// 女优库 schema_meta 的 format 标识值。
+/// 女优库 schema_meta 的 format 标识值（文件格式的一部分，
+/// 仅作记录字段的取值说明，不作判定）。
 const actressLibraryMetaFormat = 'actress_library';
 
 /// 从一个库里读到的版本信息（读不到的字段为空字符串）。
+/// 纯留痕数据：随激活记录落盘备查，不参与任何判定。
 class ActressLibraryVersionInfo {
   const ActressLibraryVersionInfo({
     this.format = '',
@@ -54,30 +35,16 @@ class ActressLibraryVersionInfo {
   final String formatVersion;
   final String coreVersion;
   final String libraryVersion;
-
-  /// schema_meta 表不存在或 format 不是女优库：视为没有版本字段。
-  /// core_version 不在必需之列（2026-11-28 取消核心门：带不带
-  /// 都不影响判定）。
-  bool get hasVersionFields =>
-      format == actressLibraryMetaFormat && formatVersion.isNotEmpty;
-
-  /// 展示用一句话（管理页激活信息）。核心版本不再显示
-  /// （2026-11-28 用户令：管理页不出现「要求核心」）。
-  String get describe {
-    if (!hasVersionFields) return '无版本字段（存量库）';
-    return '库版本 ${libraryVersion.isEmpty ? '未知' : libraryVersion}'
-        ' · 格式 $formatVersion';
-  }
 }
 
 /// 查询函数形态：给一句 SQL 回行（与 SqlImportExecutor.query /
-/// sqflite rawQuery 同形状，两条导入链共用本门的读取逻辑）。
+/// sqflite rawQuery 同形状）。
 typedef ActressMetaQuery = Future<List<Map<String, Object?>>> Function(
   String sql,
 );
 
 /// 从任意查询通道读 schema_meta（表不存在/查不动回全空信息，
-/// 不抛错——拒收原因由 [actressLibraryVersionError] 统一生成）。
+/// 不抛错——留痕读不到不挡导入）。
 Future<ActressLibraryVersionInfo> readActressLibraryVersion(
   ActressMetaQuery query,
 ) async {
@@ -103,39 +70,13 @@ Future<ActressLibraryVersionInfo> readActressLibraryVersion(
   }
 }
 
-/// 版本门判定：通过回 null，不通过回中文拒收原因（写明要求与
-/// 现状）。[supportedFormatVersion] 可注入；[currentCoreVersion]
-/// 自 2026-11-28 取消核心门后不再参与判定，保留参数只是兼容
-/// 旧调用点，传什么都不影响结果。
-String? actressLibraryVersionError(
-  ActressLibraryVersionInfo info, {
-  String supportedFormatVersion = actressLibrarySupportedFormatVersion,
-  String currentCoreVersion = actressLibraryDefaultCoreVersion,
-}) {
-  if (!info.hasVersionFields) {
-    return '这个库没有版本字段，无法激活（多半是旧版库）：'
-        '当前软件只认带版本字段的女优库'
-        '（格式版本 $supportedFormatVersion），'
-        '请换用新版库文件再导入';
-  }
-  if (info.formatVersion != supportedFormatVersion) {
-    return '女优库格式版本 ${info.formatVersion} 与当前软件支持的 '
-        '格式版本 $supportedFormatVersion 不一致，无法激活';
-  }
-  // core_version 不比对（2026-11-28 用户令取消核心门）：文件
-  // 带任何核心版本值、或干脆不带，都照常放行。
-  return null;
-}
-
-/// 对一个 .db 文件做版本门检查（只读打开读 schema_meta 即关，
-/// 绝不写文件）。文件打不开回「打不开」类原因，由调用方与结构
-/// 校验的报错合并呈现。
+/// 回读一个 .db 文件的版本信息（只读打开读 schema_meta 即关，
+/// 绝不写文件），供导入成功后落激活记录留痕。顺带报文件层
+/// 问题：文件不存在/为空、打不开时 [error] 非空（这是结构/
+/// 文件问题、不是版本判定）；调用方只拿 [info] 落记录，
+/// [error] 不再作任何拒收依据。
 Future<({ActressLibraryVersionInfo info, String? error})>
-checkActressDbFileVersion(
-  String dbPath, {
-  String supportedFormatVersion = actressLibrarySupportedFormatVersion,
-  String currentCoreVersion = actressLibraryDefaultCoreVersion,
-}) async {
+checkActressDbFileVersion(String dbPath) async {
   final file = File(dbPath);
   if (!file.existsSync() || file.lengthSync() == 0) {
     return (
@@ -154,14 +95,7 @@ checkActressDbFileVersion(
     final info = await readActressLibraryVersion(
       (sql) => db!.rawQuery(sql),
     );
-    return (
-      info: info,
-      error: actressLibraryVersionError(
-        info,
-        supportedFormatVersion: supportedFormatVersion,
-        currentCoreVersion: currentCoreVersion,
-      ),
-    );
+    return (info: info, error: null);
   } catch (e) {
     return (
       info: const ActressLibraryVersionInfo(),
