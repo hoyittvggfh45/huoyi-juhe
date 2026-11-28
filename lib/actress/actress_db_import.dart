@@ -355,6 +355,7 @@ class ActressDbImportService {
       pickedPath: externalPath,
       importedPath: importedPath,
       closeDatabase: closeDatabase,
+      allowLegacyWhenNoVersionFields: true,
     );
   }
 
@@ -366,6 +367,7 @@ class ActressDbImportService {
     required String pickedPath,
     required String importedPath,
     required Future<void> Function() closeDatabase,
+    bool allowLegacyWhenNoVersionFields = false,
   }) async {
     final validation = await _dbValidator(pickedPath);
     if (!validation.ok) {
@@ -375,9 +377,25 @@ class ActressDbImportService {
       );
     }
     // 版本门：结构认得出还不够，版本字段必须与当前软件对得上。
+    // 例外（2026-11-28 解码修复批）：外置库导入激活传
+    // [allowLegacyWhenNoVersionFields]——外置 MYTV/db/女优库.db
+    // 是版本门制度之前发给用户的定版库（v4，449,339 部），压根
+    // 没有 schema_meta、更没有版本字段，用户一直拿它当外置库
+    // 用；点「导入激活」却被告知「没有版本字段无法激活」，与
+    // 存量口径（已在用的库继续可用）自相矛盾。故外置这条路：
+    // 结构校验已过、且纯粹是缺字段（字段在但对不上仍拒），
+    // 按存量放行、激活记录记 origin=legacy。统一口选任意 .db
+    // 文件导入不传此旗，硬门不松。
     final version = await _dbVersionChecker(pickedPath);
+    var activatedOrigin = 'import';
     if (version.error != null) {
-      return ActressDbImportOutcome(ok: false, error: version.error);
+      final missingFieldsOnly = !version.info.hasVersionFields &&
+          version.error!.contains('没有版本字段');
+      if (allowLegacyWhenNoVersionFields && missingFieldsOnly) {
+        activatedOrigin = 'legacy';
+      } else {
+        return ActressDbImportOutcome(ok: false, error: version.error);
+      }
     }
     final stagingPath = '$importedPath.importing-db';
     final staging = File(stagingPath);
@@ -430,7 +448,7 @@ class ActressDbImportService {
       );
     }
     await _source.markActivated(
-      origin: 'import',
+      origin: activatedOrigin,
       libraryVersion: version.info.libraryVersion,
       formatVersion: version.info.formatVersion,
       coreVersion: version.info.coreVersion,

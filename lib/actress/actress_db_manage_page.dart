@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../services/site_library.dart';
+import '../services/sql_text_stream.dart';
 import '../services/source_registry.dart';
 import '../services/unified_import.dart';
 import 'actress_database.dart';
@@ -221,7 +222,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       if (!mounted) return;
       setState(() {
         _importing = false;
-        _error = '导入失败：${e.toString().split('\n').first}';
+        _error = '导入失败：${importFailureZh(e)}';
       });
     }
   }
@@ -310,7 +311,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _unifiedError = '导入失败：${e.toString().split('\n').first}';
+        _unifiedError = '导入失败：${importFailureZh(e)}';
         _unifiedMessage = null;
       });
       return;
@@ -437,7 +438,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       setState(() {
         _importing = false;
         _progress = null;
-        _error = '导入失败：${e.toString().split('\n').first}';
+        _error = '导入失败：${importFailureZh(e)}';
       });
     } finally {
       if (deleteAfter) {
@@ -562,7 +563,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       setState(() {
         _magnetImporting = false;
         _magnetProgress = null;
-        _error = '磁力分类库导入失败：${e.toString().split('\n').first}';
+        _error = '磁力分类库导入失败：${importFailureZh(e)}';
       });
     } finally {
       if (deleteAfter) {
@@ -744,7 +745,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       setState(() {
         _siteImporting = false;
         _siteProgress = null;
-        _siteError = '导入失败：${e.toString().split('\n').first}';
+        _siteError = '导入失败：${importFailureZh(e)}';
       });
     } finally {
       if (deleteAfter) {

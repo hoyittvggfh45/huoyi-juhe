@@ -10,6 +10,7 @@ import 'package:sqflite/sqflite.dart';
 import 'live_sources.dart';
 import 'public_folder.dart';
 import 'site_library_bundle.dart';
+import 'sql_text_stream.dart';
 
 /// 站点库服务层（2026-11-27 站点库批）：独立第三库，物理文件落在
 /// 应用支持目录 `site_library/site_library.db`，与女优库双槽完全
@@ -464,13 +465,12 @@ class SiteLibraryImporter {
 
       Stream<List<int>> byteStream = sqlFile.openRead();
       if (isGz) byteStream = byteStream.transform(gzip.decoder);
-      final lines = byteStream
-          .map((chunk) {
-            bytesRead += chunk.length;
-            return chunk;
-          })
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
+      final lines = sqlTextLines(
+        byteStream.map((chunk) {
+          bytesRead += chunk.length;
+          return chunk;
+        }),
+      );
       await for (final line in lines) {
         checkCancelled();
         for (final statement in splitter.addLine(line)) {
@@ -564,7 +564,7 @@ class SiteLibraryImporter {
     } catch (e) {
       return SiteLibraryImportOutcome(
         ok: false,
-        error: '导入失败：${e.toString().split('\n').first}',
+        error: '导入失败：${importFailureZh(e)}',
       );
     } finally {
       try {

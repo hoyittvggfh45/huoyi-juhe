@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:sqflite/sqflite.dart';
 
+import '../services/sql_text_stream.dart';
 import 'actress_generic_db.dart';
 import 'actress_library_version.dart';
 
@@ -376,13 +377,12 @@ class ActressSqlImporter {
 
       Stream<List<int>> byteStream = sqlFile.openRead();
       if (isGz) byteStream = byteStream.transform(gzip.decoder);
-      final lines = byteStream
-          .map((chunk) {
-            bytesRead += chunk.length;
-            return chunk;
-          })
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
+      final lines = sqlTextLines(
+        byteStream.map((chunk) {
+          bytesRead += chunk.length;
+          return chunk;
+        }),
+      );
       await for (final line in lines) {
         checkCancelled();
         for (final statement in splitter.addLine(line)) {
@@ -540,7 +540,7 @@ class ActressSqlImporter {
     } catch (e) {
       return ActressSqlImportResult(
         ok: false,
-        error: '导入失败：${e.toString().split('\n').first}',
+        error: '导入失败：${importFailureZh(e)}',
         needsReload: closedDb,
       );
     } finally {

@@ -456,7 +456,10 @@ void main() {
       expect(outcome.error, contains('还没绑定'));
     });
 
-    test('外置版本门不过：拒、imported 不落地', () async {
+    test('外置缺版本字段：存量放行、落 legacy 激活（2026-11-28 口径）', () async {
+      // 外置 MYTV/db/女优库.db 是版本门制度之前发给用户的定版
+      // 库（v4），压根没有版本字段；结构校验过关时按存量放行，
+      // 不再报「没有版本字段无法激活」。
       File(externalDb).writeAsStringSync('EXTDB');
       final source = fakeSource(
         externalPath: externalDb,
@@ -476,8 +479,39 @@ void main() {
       final outcome = await service.importExternalFile(
         closeDatabase: () async {},
       );
+      expect(outcome.ok, isTrue);
+      expect(outcome.videos, 9);
+      expect(File(importedDb).readAsStringSync(), 'EXTDB');
+      final status = await source.status();
+      expect(status.activation?.origin, 'legacy');
+    });
+
+    test('外置版本字段在但对不上：仍拒、imported 不落地', () async {
+      File(externalDb).writeAsStringSync('EXTDB');
+      final source = fakeSource(
+        externalPath: externalDb,
+        importedPath: importedDb,
+      );
+      const info = ActressLibraryVersionInfo(
+        format: actressLibraryMetaFormat,
+        formatVersion: '1',
+        coreVersion: '1999.01.01',
+        libraryVersion: 'x',
+      );
+      final service = ActressDbImportService(
+        source: source,
+        dbValidator: (_) async =>
+            const ActressDbValidation(ok: true, works: 9),
+        dbVersionChecker: (_) async => (
+          info: info,
+          error: actressLibraryVersionError(info),
+        ),
+      );
+      final outcome = await service.importExternalFile(
+        closeDatabase: () async {},
+      );
       expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('没有版本字段'));
+      expect(outcome.error, contains('版本对不上'));
       expect(File(importedDb).existsSync(), isFalse);
     });
   });
@@ -597,15 +631,20 @@ void main() {
       expect(status.activation!.origin, 'import');
     });
 
-    testWidgets('点导入激活被版本门拒：中文原因上屏、仍未激活', (tester) async {
+    testWidgets('点导入激活被版本门拒（字段在但对不上）：中文原因上屏、仍未激活',
+        (tester) async {
+      const info = ActressLibraryVersionInfo(
+        format: actressLibraryMetaFormat,
+        formatVersion: '1',
+        coreVersion: '1999.01.01',
+        libraryVersion: 'x',
+      );
       await pumpPage(
         tester,
         withImported: false,
         versionChecker: (_) async => (
-          info: const ActressLibraryVersionInfo(),
-          error: actressLibraryVersionError(
-            const ActressLibraryVersionInfo(),
-          ),
+          info: info,
+          error: actressLibraryVersionError(info),
         ),
       );
       await tester.tap(find.byKey(const ValueKey('dual-import-external')));
@@ -613,7 +652,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 50));
       await tester.pump();
       expect(find.byKey(const ValueKey('dual-error')), findsOneWidget);
-      expect(find.textContaining('没有版本字段'), findsWidgets);
+      expect(find.textContaining('版本对不上'), findsWidgets);
       expect(find.byKey(const ValueKey('activation-guide')), findsOneWidget);
       expect(find.byKey(const ValueKey('dual-current-imported')), findsNothing);
     });

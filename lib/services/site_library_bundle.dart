@@ -11,6 +11,7 @@ import '../actress/actress_db_import.dart';
 import '../actress/actress_db_source.dart';
 import '../actress/actress_magnet_library.dart';
 import 'site_library.dart';
+import 'sql_text_stream.dart';
 
 /// 合并文件（bundle）分段导入器（2026-11-27 站点库续办批）：
 /// 一份「凡人修仙站点.sql」装三段（site/actress/magnet），格式
@@ -463,14 +464,21 @@ class SiteLibraryBundleImporter {
     if (sqlPath.toLowerCase().endsWith('.gz')) {
       stream = stream.transform(gzip.decoder);
     }
-    const needle = 'bundle_manifest';
-    var tail = '';
-    await for (final chunk in stream.transform(utf8.decoder)) {
-      final text = tail + chunk;
-      if (text.contains(needle)) return true;
-      tail = text.length <= needle.length
-          ? text
-          : text.substring(text.length - needle.length);
+    // 按字节找 ASCII 标记（不解码，2026-11-28 解码修复批：
+    // 不再依赖运行时的分块 UTF-8 解码器）。
+    final needle = utf8.encode('bundle_manifest');
+    var tail = <int>[];
+    await for (final chunk in stream) {
+      final data = [...tail, ...chunk];
+      outer:
+      for (var i = 0; i + needle.length <= data.length; i++) {
+        for (var j = 0; j < needle.length; j++) {
+          if (data[i + j] != needle[j]) continue outer;
+        }
+        return true;
+      }
+      final keep = needle.length - 1;
+      tail = data.length <= keep ? data : data.sublist(data.length - keep);
     }
     return false;
   }
@@ -717,7 +725,7 @@ class SiteLibraryBundleImporter {
     } catch (e) {
       return SiteLibraryImportOutcome(
         ok: false,
-        error: '导入失败：${e.toString().split('\n').first}',
+        error: '导入失败：${importFailureZh(e)}',
       );
     } finally {
       try {
@@ -1041,13 +1049,12 @@ class SiteLibraryBundleImporter {
     if (sqlPath.toLowerCase().endsWith('.gz')) {
       byteStream = byteStream.transform(gzip.decoder);
     }
-    final lines = byteStream
-        .map((chunk) {
-          bytesRead += chunk.length;
-          return chunk;
-        })
-        .transform(utf8.decoder)
-        .transform(const LineSplitter());
+    final lines = sqlTextLines(
+      byteStream.map((chunk) {
+        bytesRead += chunk.length;
+        return chunk;
+      }),
+    );
     await for (final line in lines) {
       checkCancelled();
       for (final statement in splitter.addLine(line)) {
