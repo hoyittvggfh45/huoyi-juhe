@@ -8,6 +8,7 @@ import 'actress_database.dart' show applyActressDbReadPragmas;
 import 'actress_db_source.dart';
 import 'actress_generic_db.dart';
 import 'actress_library_version.dart';
+import 'actress_magnet_library.dart';
 import 'actress_sql_import.dart';
 
 /// 双库导入服务（2026-11-27 双库批）：统一入口收 .db / .sql /
@@ -183,18 +184,26 @@ class ActressDbImportService {
     ActressSqlImporter? sqlImporter,
     ActressDbVersionChecker? dbVersionChecker,
     Future<String> Function()? publicRootProvider,
+    // 导入后磁力分类自动登记开导入槽库的口（仅测试注入，
+    // 生产走数据层缺省 sqflite 打开）。参数名须公开（私有初
+    // 始化形参跨库传不进来），故不用 this._magnetDbOpener。
+    // ignore: prefer_initializing_formals
+    Future<Database> Function(String path)? magnetDbOpener,
   }) : _source = source ?? ActressDbSource.instance,
        _dbValidator = dbValidator ?? validateActressDbFile,
        _sqlImporter = sqlImporter ?? ActressSqlImporter(),
        _dbVersionChecker =
            dbVersionChecker ??
            ((path) => checkActressDbFileVersion(path)),
-       _publicRootProvider = publicRootProvider ?? PublicFolder.publicRoot;
+       _publicRootProvider = publicRootProvider ?? PublicFolder.publicRoot,
+       // ignore: prefer_initializing_formals
+       _magnetDbOpener = magnetDbOpener;
 
   final ActressDbSource _source;
   final ActressDbValidator _dbValidator;
   final ActressSqlImporter _sqlImporter;
   final ActressDbVersionChecker _dbVersionChecker;
+  final Future<Database> Function(String path)? _magnetDbOpener;
 
   /// 手机根目录提供者（MYTV/db 直读入口用；测试可注入）。
   final Future<String> Function() _publicRootProvider;
@@ -246,6 +255,7 @@ class ActressDbImportService {
     required Future<void> Function() closeDatabase,
     void Function(ActressSqlImportProgress)? onProgress,
     bool Function()? isCancelled,
+    String? sourceName,
   }) async {
     final lower = localPath.toLowerCase();
     final isSql = lower.endsWith('.sql') || lower.endsWith('.sql.gz');
@@ -276,11 +286,13 @@ class ActressDbImportService {
       closeDatabase: closeDatabase,
       onProgress: onProgress,
       isCancelled: isCancelled,
+      sourceName: sourceName,
     );
     return _importDb(
       pickedPath: localPath,
       importedPath: importedPath,
       closeDatabase: closeDatabase,
+      sourceName: sourceName,
     );
   }
 
@@ -290,6 +302,7 @@ class ActressDbImportService {
     required Future<void> Function() closeDatabase,
     void Function(ActressSqlImportProgress)? onProgress,
     bool Function()? isCancelled,
+    String? sourceName,
   }) async {
     final result = await _sqlImporter.importFile(
       sqlPath: sqlPath,
@@ -298,6 +311,7 @@ class ActressDbImportService {
       onProgress: onProgress ?? (_) {},
       isCancelled: isCancelled,
     );
+    var warnings = result.warnings;
     if (result.ok) {
       // 激活：版本门已在导入器内过，这里回读新库版本字段落
       // 激活记录（回读失败不挡激活，版本信息留空）。
@@ -311,6 +325,13 @@ class ActressDbImportService {
         formatVersion: info.formatVersion,
         coreVersion: info.coreVersion,
       );
+      warnings = [
+        ...warnings,
+        ...await _autoRegisterMagnets(
+          importedPath,
+          sourceName ?? sqlPath.split('/').last.split('\\').last,
+        ),
+      ];
     }
     return ActressDbImportOutcome(
       ok: result.ok,
@@ -318,9 +339,30 @@ class ActressDbImportService {
       videos: result.videos,
       actresses: result.actresses,
       playUrls: result.playUrls,
-      warnings: result.warnings,
+      warnings: warnings,
       needsReload: result.needsReload,
     );
+  }
+
+  /// 整库导入后的磁力分类自动登记（2026-11-28 用户令）：
+  /// 合并库这类「自带磁力作品与分类、却没有磁力登记」的库，
+  /// 落槽激活后按库内实际分类补登记，演员库分类栏才会显示
+  /// 这些分类。登记失败不算导入失败（作品已落槽、已激活）：
+  /// 记一条中文警告，打开演员库时还会自动再补一次。
+  Future<List<String>> _autoRegisterMagnets(
+    String importedPath,
+    String sourceName,
+  ) async {
+    try {
+      await autoRegisterMagnetCategoriesInDbFile(
+        importedPath,
+        sourceName: sourceName,
+        openDb: _magnetDbOpener,
+      );
+      return const [];
+    } catch (_) {
+      return const ['磁力分类这次没登记上（不影响看库，打开演员库时会自动补登记）'];
+    }
   }
 
   /// 外置文件导入激活：把外置槽当前文件（MYTV/db/女优库.db 或
@@ -368,6 +410,7 @@ class ActressDbImportService {
     required String importedPath,
     required Future<void> Function() closeDatabase,
     bool allowLegacyWhenNoVersionFields = false,
+    String? sourceName,
   }) async {
     final validation = await _dbValidator(pickedPath);
     if (!validation.ok) {
@@ -453,9 +496,14 @@ class ActressDbImportService {
       formatVersion: version.info.formatVersion,
       coreVersion: version.info.coreVersion,
     );
+    final regWarnings = await _autoRegisterMagnets(
+      importedPath,
+      sourceName ?? pickedPath.split('/').last.split('\\').last,
+    );
     return ActressDbImportOutcome(
       ok: true,
       videos: validation.works,
+      warnings: regWarnings,
       needsReload: true,
     );
   }

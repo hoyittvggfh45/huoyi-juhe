@@ -213,16 +213,43 @@ expect(error, contains('格式版本 2'));
 expect(error, contains('格式版本 1 不一致'));
 });
 
-test('核心版本对不上：写明要求与现状', () {
-final error = actressLibraryVersionError(
+test('核心版本对不上也放行（2026-11-28 取消核心门）', () {
+expect(
+actressLibraryVersionError(
 const ActressLibraryVersionInfo(
 format: 'actress_library',
 formatVersion: '1',
 coreVersion: '2027.01.01',
 ),
+),
+isNull,
 );
-expect(error, contains('要求核心版本 2027.01.01'));
-expect(error, contains('当前软件核心版本是 2026.11.27'));
+});
+
+test('核心版本是未来值 2099 也照常放行（防把门加回来）', () {
+expect(
+actressLibraryVersionError(
+const ActressLibraryVersionInfo(
+format: 'actress_library',
+formatVersion: '1',
+coreVersion: '2099.01.01',
+libraryVersion: '2099v1',
+),
+),
+isNull,
+);
+});
+
+test('缺 core_version 字段（format 与格式版本在）：放行', () {
+expect(
+actressLibraryVersionError(
+const ActressLibraryVersionInfo(
+format: 'actress_library',
+formatVersion: '1',
+),
+),
+isNull,
+);
 });
 
 test('全对：放行（返回 null）', () {
@@ -368,6 +395,9 @@ File(externalDb).writeAsStringSync('EXTDB');
 final source = fakeSource(
 externalPath: externalDb,
 importedPath: importedDb,
+// 兜底令（2026-11-28）后：结构过关的外置会自动兜底出数据；
+// 本组测的是「没有可用库」的硬门，外置按结构不过关注入。
+works: 0,
 );
 final fallback = ActressLibraryDbFallback(
 pathResolver: source.effectiveDbPath,
@@ -392,6 +422,9 @@ File(externalDb).writeAsStringSync('EXTDB');
 final source = fakeSource(
 externalPath: externalDb,
 importedPath: importedDb,
+// 兜底令（2026-11-28）后：结构过关的外置会自动兜底出数据；
+// 本组测的是「没有可用库」的硬门，外置按结构不过关注入。
+works: 0,
 );
 final fallback = ActressLibraryDbFallback(
 pathResolver: source.effectiveDbPath,
@@ -450,6 +483,9 @@ File(externalDb).writeAsStringSync('EXTDB');
 final source = fakeSource(
 externalPath: externalDb,
 importedPath: importedDb,
+// 兜底令（2026-11-28）后：结构过关的外置会自动兜底出数据；
+// 本组测的是「没有可用库」的硬门，外置按结构不过关注入。
+works: 0,
 );
 await tester.pumpWidget(
 MaterialApp(

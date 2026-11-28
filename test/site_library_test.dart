@@ -339,13 +339,12 @@ void main() {
       expect(outcome.error, contains('支持的 1'));
     });
 
-    test('核心版本不符拒收（原因写明两边版本）', () async {
+    test('核心版本任意值照常放行（2026-11-28 取消核心门）', () async {
       final outcome = await runImport(
         _LibFixture(coreVersion: '1999.01.01'),
       );
-      expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('核心版本 1999.01.01'));
-      expect(outcome.error, contains('2026.11.27'));
+      expect(outcome.ok, isTrue);
+      expect(outcome.error, isNull);
     });
 
     test('版本字段被篡改：payload 对不上拒收', () async {
@@ -419,18 +418,15 @@ void main() {
       expect(channels.single.title, '台一');
     });
 
-    test('落盘库版本不符：不激活、文件保留、原因可读', () async {
+    test('落盘库核心版本任意值：照常激活（2026-11-28 取消核心门）', () async {
       final dbFile = File('${libDir.path}/site_library.db');
       await dbFile.writeAsString('DB');
       final service = makeService(
         _LibFixture(coreVersion: '1999.01.01'),
       );
       await service.load();
-      expect(service.imported, isFalse);
-      expect(service.stations, isEmpty);
-      expect(LiveSources.sqlSources, isEmpty);
-      expect(service.loadRejectionReason, contains('核心版本 1999.01.01'));
-      expect(service.loadRejectionReason, contains('2026.11.27'));
+      expect(service.imported, isTrue);
+      expect(service.loadRejectionReason, isNull);
       expect(await dbFile.exists(), isTrue);
     });
 

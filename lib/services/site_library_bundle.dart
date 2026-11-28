@@ -10,15 +10,17 @@ import '../actress/actress_database.dart' show SqfliteActressDatabase;
 import '../actress/actress_db_import.dart';
 import '../actress/actress_db_source.dart';
 import '../actress/actress_magnet_library.dart';
+import 'import_debug_log.dart';
 import 'site_library.dart';
 import 'sql_text_stream.dart';
 
 /// 合并文件（bundle）分段导入器（2026-11-27 站点库续办批）：
 /// 一份「凡人修仙站点.sql」装三段（site/actress/magnet），格式
 /// 见 SEGMENT_SPEC.md 段格式规格 v1。导入算法照规格 §5：
-/// 流式执行整文件进 staging 临时库 → 验整文件签名（不过全拒）
-/// → 逐段验（payload/签名/版本门，不过只拒该段、中文原因）
-/// → 逐段落位（site 剥前缀建站点库.db 先验后换；actress 剥
+/// 流式执行整文件进 staging 临时库 → 验整文件签名与整库
+/// 版本门（不过全拒；版本门只留这一道，2026-11-28 设计令）
+/// → 逐段完整性校验（计数/payload/签名/代码哈希，坏段定位
+/// 到段、但整库一体：一段不过整库不导）→ 逐段落位（site 剥
 /// 前缀建段 .db 交女优库导入链；magnet 剥前缀建段 .db 交磁力
 /// 并存合并链）。旧无前缀单段文件不走这里（服务层粗扫不到
 /// bundle_manifest 字样时直接走现行单段路；粗扫误报时本类
@@ -282,6 +284,10 @@ productionActressSegmentLander(String segmentDbPath) async {
   final outcome = await ActressDbImportService().importLocalFile(
     localPath: segmentDbPath,
     closeDatabase: () => SqfliteActressDatabase.instance.close(),
+    // 来源名与磁力段落位同口径（整份文件的名字）：演员段导
+    // 入尾段的磁力分类自动登记拿它给无分类作品的兜底片命
+    // 名，两段口径一致才不会生出两个兜底片。
+    sourceName: '凡人修仙站点.sql',
   );
   if (!outcome.ok) {
     return (
@@ -420,6 +426,7 @@ class SiteLibraryBundleImporter {
     SiteLibraryMagnetLander? magnetLander,
     Future<void> Function(String segment, String segmentDbPath)?
     segmentDbPostProcess,
+    this.decodedStreamWrapper,
   }) : _executorFactory =
            executorFactory ??
            ((tempPath) async {
@@ -442,6 +449,9 @@ class SiteLibraryBundleImporter {
   /// 正文/播放地址）按条数攒批会把单批载荷顶到几 MB，字节
   /// 上限把单批载荷封顶。
   final int batchByteLimit;
+
+  /// 兼容保留字段：2026-11-28 取消核心门后不再参与任何比对
+  /// （旧调用点传值无害），见 importFile 整库门注释。
   final String currentCoreVersion;
   final String supportedFormatVersion;
   final Future<SiteLibrarySqlExecutor> Function(String tempPath)
@@ -451,6 +461,16 @@ class SiteLibraryBundleImporter {
   final SiteLibraryMagnetLander _magnetLander;
   final Future<void> Function(String segment, String segmentDbPath)
   _segmentDbPostProcess;
+
+  /// 对抗测试注入缝（生产恒 null）：包住解压后的字节流，
+  /// 模拟真机那种任意分块/分段交付。生产口径不经它。
+  final Stream<List<int>> Function(Stream<List<int>> stream)?
+  decodedStreamWrapper;
+
+  /// 当前导入阶段（真机定点日志用，细到环节）：staging →
+  /// 整文件校验 → 逐段校验 → 逐段落位，异常时按它记日志、
+  /// 失败文案也带它。
+  var _stage = 'staging';
 
   static const _knownSegments = ['site', 'actress', 'magnet'];
 
@@ -501,6 +521,8 @@ class SiteLibraryBundleImporter {
         error: '选中的文件不存在或为空',
       );
     }
+    _stage = 'staging（整文件流式执行进临时库）';
+    await ImportDebugLog.reset('三库合并文件 $sqlPath');
     try {
       await Directory(workDir).create(recursive: true);
     } catch (_) {}
@@ -543,7 +565,12 @@ class SiteLibraryBundleImporter {
         ),
       );
 
+      _stage = '整文件校验（清单/签名/版本门）';
       // ---- 整文件层：清单/格式/整签/整文件版本门，不过全拒 ----
+      // 版本门只留这一道整库的（2026-11-28 用户设计令：站点
+      // 不再单独成库、单独设门，导入激活整份数据库时三段
+      // 一并激活）；段层只做完整性校验（计数/payload/签名/
+      // 代码哈希），坏在哪段报哪段，但不再逐段版本拒收。
       final bundleRows = await executor.query(
         'SELECT bundle_format, format_version, core_version, '
         'bundle_version, segments, payload_sha256, signature '
@@ -563,7 +590,6 @@ class SiteLibraryBundleImporter {
         );
       }
       final bundleFormatVersion = '${bundle['format_version'] ?? ''}';
-      final bundleCoreVersion = '${bundle['core_version'] ?? ''}';
       final bundleVersion = '${bundle['bundle_version'] ?? ''}';
       final segmentNames = '${bundle['segments'] ?? ''}'
           .split(',')
@@ -642,21 +668,30 @@ class SiteLibraryBundleImporter {
               '$supportedFormatVersion 不符，已整份拒收',
         );
       }
-      if (bundleCoreVersion != currentCoreVersion) {
-        return SiteLibraryImportOutcome(
-          ok: false,
-          error: '合并文件要求核心版本 $bundleCoreVersion，'
-              '当前软件版本是 $currentCoreVersion，不匹配，已整份拒收',
-        );
-      }
+      // 核心版本不再设门（2026-11-28 13:25 用户令「取消这
+      // 个」）：bundle_manifest.core_version 带什么值都不拒，
+      // 只随清单留痕；整库门只剩格式版本＋签名/哈希完整性。
 
-      // ---- 逐段验：不过只拒该段 ----
+      // ---- 逐段完整性校验：坏段定位到段，但整库一体 ----
+      // 一份数据库、一次激活：任何一段完整性不过，整库不
+      // 导入、不落位任何一段（旧库原样不动）；全部段过完
+      // 才逐段落位。段结果照实回报（哪段坏、哪段本身是好
+      // 的），页面按整库口径汇总，不再三段三种命运。
       final verified = <String, _SegmentPlan>{};
       final results = <String, SiteLibrarySegmentResult>{};
+      String? firstRejection;
       for (final seg in segmentNames) {
         final plan = plans[seg]!;
+        final label =
+            SiteLibrarySegmentResult(segment: seg, ok: false).segmentLabel;
+        _stage = '$label段校验';
         final rejection = await _verifySegment(executor, plan);
         if (rejection != null) {
+          firstRejection ??= rejection;
+          await ImportDebugLog.record(
+            stage: _stage,
+            error: rejection,
+          );
           results[seg] = SiteLibrarySegmentResult(
             segment: seg,
             ok: false,
@@ -665,6 +700,24 @@ class SiteLibraryBundleImporter {
         } else {
           verified[seg] = plan;
         }
+      }
+      if (firstRejection != null) {
+        for (final seg in verified.keys) {
+          results[seg] = SiteLibrarySegmentResult(
+            segment: seg,
+            ok: false,
+            error: '本段完整性已通过，但整库校验未通过，没有导入',
+          );
+        }
+        final ordered = [
+          for (final seg in segmentNames)
+            if (results[seg] != null) results[seg]!,
+        ];
+        return SiteLibraryImportOutcome(
+          ok: false,
+          error: '数据库校验未通过，没有导入：$firstRejection',
+          segmentResults: ordered,
+        );
       }
 
       // ---- 逐段落位（site → actress → magnet 固定序） ----
@@ -676,6 +729,9 @@ class SiteLibraryBundleImporter {
         final plan = verified[seg];
         if (plan == null) continue;
         checkCancelled();
+        final label =
+            SiteLibrarySegmentResult(segment: seg, ok: false).segmentLabel;
+        _stage = '$label段落位';
         onProgress(
           SiteLibraryProgress(
             phase: '正在落位',
@@ -691,6 +747,12 @@ class SiteLibraryBundleImporter {
           plan: plan,
         );
         results[seg] = result;
+        if (!result.ok) {
+          await ImportDebugLog.record(
+            stage: _stage,
+            error: result.error ?? '落位失败',
+          );
+        }
         if (seg == 'site' && result.ok) {
           stationCount = _siteStationCounts[plan.payloadSha256] ?? 0;
           siteLibraryVersion = plan.libraryVersion;
@@ -700,14 +762,14 @@ class SiteLibraryBundleImporter {
         for (final seg in segmentNames)
           if (results[seg] != null) results[seg]!,
       ];
-      final anyLanded = ordered.any((r) => r.ok);
-      if (!anyLanded) {
+      final allLanded = ordered.every((r) => r.ok);
+      if (!allLanded) {
         final firstError = ordered
             .map((r) => r.error)
             .firstWhere((e) => e != null, orElse: () => null);
         return SiteLibraryImportOutcome(
           ok: false,
-          error: '没有一段通过校验：${firstError ?? '未知原因'}',
+          error: '数据库落位未完成：${firstError ?? '未知原因'}',
           segmentResults: ordered,
         );
       }
@@ -722,10 +784,11 @@ class SiteLibraryBundleImporter {
         ok: false,
         error: '已取消，数据库未改动',
       );
-    } catch (e) {
+    } catch (e, stack) {
+      await ImportDebugLog.record(stage: _stage, error: e, stack: stack);
       return SiteLibraryImportOutcome(
         ok: false,
-        error: '导入失败：${importFailureZh(e)}',
+        error: '导入失败（$_stage）：${importFailureZh(e)}',
       );
     } finally {
       try {
@@ -769,8 +832,9 @@ class SiteLibraryBundleImporter {
     return tables;
   }
 
-  /// 逐段三关：payload 重算 → 签名 → 版本门（＋行数对账）。
-  /// 过关回 null，不过回中文拒因（写明段名与两边版本）。
+  /// 逐段完整性：行数对账 → payload 重算 → 签名（站点段另
+  /// 含代码逐行哈希）。过关回 null，不过回中文拒因（写明
+  /// 段名）。版本门不在段层（只留整库一道，见文件头）。
   Future<String?> _verifySegment(
     SiteLibrarySqlExecutor executor,
     _SegmentPlan plan,
@@ -836,14 +900,9 @@ class SiteLibraryBundleImporter {
         plan.signature != computeSiteLibrarySignature(payload)) {
       return '$label段签名不对，已拒收这一段';
     }
-    if (plan.formatVersion != supportedFormatVersion) {
-      return '$label段格式版本 ${plan.formatVersion} 与当前软件支持的 '
-          '$supportedFormatVersion 不符，已拒收这一段';
-    }
-    if (plan.coreVersion != currentCoreVersion) {
-      return '$label段要求核心版本 ${plan.coreVersion}，'
-          '当前软件版本是 $currentCoreVersion，不匹配，已拒收这一段';
-    }
+    // 段清单里的 format_version/core_version 只作记录，不再
+    // 单独设门（2026-11-28 用户设计令：版本门只留整库一道，
+    // 在整文件层已验；站点不再单独成库单独激活）。
     return null;
   }
 
@@ -1049,6 +1108,8 @@ class SiteLibraryBundleImporter {
     if (sqlPath.toLowerCase().endsWith('.gz')) {
       byteStream = byteStream.transform(gzip.decoder);
     }
+    final wrapper = decodedStreamWrapper;
+    if (wrapper != null) byteStream = wrapper(byteStream);
     final lines = sqlTextLines(
       byteStream.map((chunk) {
         bytesRead += chunk.length;

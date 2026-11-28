@@ -33,6 +33,7 @@ class FilmDetailFill {
     this.originTitle = '',
     this.tags = const <String>[],
     this.stills = const <String>[],
+    this.magnets = const <String>[],
   });
 
   /// 番号（调用方传入的原样回填）。
@@ -77,6 +78,12 @@ class FilmDetailFill {
   /// 剧照地址列表（去重，上限 24）。
   final List<String> stills;
 
+  /// 库内磁力链接（本地库按番号反查的 detail 自带 magnetUrls
+  /// 全量）：片库详情页磁力区的唯一来源——库里这个番号挂有
+  /// 磁力才有，补不到就是空，不许从别处编（2026-11-28 验收
+  /// 线：磁力是补全项之一，不许只补封面演员不补磁力）。
+  final List<String> magnets;
+
   /// 补来的数据字段全空 = 三路都没补到东西（code 是入参番号、
   /// 不是补来的数据，不计在内，否则回填番号的 fill 永不为空）。
   bool get isEmpty =>
@@ -92,7 +99,8 @@ class FilmDetailFill {
       scoreCount == 0 &&
       originTitle.isEmpty &&
       tags.isEmpty &&
-      stills.isEmpty;
+      stills.isEmpty &&
+      magnets.isEmpty;
 }
 
 /// 从页面已有信息里抠番号：先 id+title 走 [JavCodeMeta.resolveCode]，
@@ -182,6 +190,7 @@ Future<FilmDetailFill> fillFilmDetailByCode({
     var pic = '';
     var date = '';
     var tags = const <String>[];
+    var magnets = const <String>[];
     try {
       final search = await handle({'op': 'search', 'q': trimmedCode, 'page': 1});
       if (search['ok'] == true) {
@@ -212,6 +221,18 @@ Future<FilmDetailFill> fillFilmDetailByCode({
                     if (tag.toString().trim().isNotEmpty) tag.toString().trim(),
                 ];
               }
+              // 磁力是补全项之一：detail 自带的 magnetUrls 全
+              // 量原样带走（去重保序），页面磁力区只认这一份。
+              final rawMagnets = item['magnetUrls'];
+              if (rawMagnets is List) {
+                final seen = <String>{};
+                magnets = [
+                  for (final url in rawMagnets)
+                    if (url.toString().trim().isNotEmpty &&
+                        seen.add(url.toString().trim()))
+                      url.toString().trim(),
+                ];
+              }
             }
           }
         }
@@ -219,7 +240,13 @@ Future<FilmDetailFill> fillFilmDetailByCode({
     } catch (_) {
       // 本路失败留空，不拖垮其余两路。
     }
-    return (content: content, pic: pic, date: date, tags: tags);
+    return (
+      content: content,
+      pic: pic,
+      date: date,
+      tags: tags,
+      magnets: magnets,
+    );
   }();
 
   final javdb = await javdbFuture;
@@ -335,5 +362,6 @@ Future<FilmDetailFill> fillFilmDetailByCode({
     originTitle: originTitle,
     tags: tags,
     stills: stills,
+    magnets: dbDetail.magnets,
   );
 }

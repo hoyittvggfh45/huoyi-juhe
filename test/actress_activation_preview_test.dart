@@ -99,19 +99,21 @@ void main() {
   });
 
   testWidgets('预览2：版本不符提示', (tester) async {
+    // 2026-11-28 取消核心门后，版本不符只剩格式版本：用格式
+    // 版本 2 造不符（核心版本写什么都不再拒）。
     await pumpManage(
       tester,
       versionChecker: (_) async => (
         info: const ActressLibraryVersionInfo(
           format: 'actress_library',
-          formatVersion: '1',
+          formatVersion: '2',
           coreVersion: '2027.01.01',
           libraryVersion: '20270101',
         ),
         error: actressLibraryVersionError(
           const ActressLibraryVersionInfo(
             format: 'actress_library',
-            formatVersion: '1',
+            formatVersion: '2',
             coreVersion: '2027.01.01',
             libraryVersion: '20270101',
           ),
@@ -123,7 +125,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
     await tester.pump();
     expect(find.byKey(const ValueKey('dual-error')), findsOneWidget);
-    expect(find.textContaining('要求核心版本 2027.01.01'), findsWidgets);
+    expect(find.textContaining('格式版本 2'), findsWidgets);
     await _savePng(tester, 'preview_version_mismatch.png');
   });
 }

@@ -4,6 +4,7 @@ import 'package:sqflite/sqflite.dart';
 
 import 'actress_database.dart' show applyActressDbReadPragmas;
 import 'actress_db_source.dart';
+import 'actress_magnet_library.dart' show ActressMagnetAutoRegistration;
 import 'actress_models.dart' show actressNameKey, normalizeAvCode;
 import 'actress_mytv_bind.dart';
 
@@ -43,13 +44,21 @@ class ActressLibraryDbFallback {
     ActressLibPathResolver? pathResolver,
     Future<ActressLibRawQuery?> Function(String path)? opener,
   }) : _pathResolver = pathResolver ?? _resolveBoundDbPath,
-       _opener = opener ?? _openReadOnlyAt;
+       _opener = opener ?? _openReadOnlyAt,
+       // 存量补登记只挂生产默认装配（页面无参构造 / shared）：
+       // 注入假路径/假开库的调用方（测试与探库）不许被真实
+       // 环境的文件戳检查与补登记拖住或改动。
+       _backfillOnOpen = pathResolver == null && opener == null;
 
   /// 进程级共享实例（桥每次调用复用同一连接）。
   static final ActressLibraryDbFallback shared = ActressLibraryDbFallback();
 
   final ActressLibPathResolver _pathResolver;
   final Future<ActressLibRawQuery?> Function(String path) _opener;
+
+  /// 打开前是否先跑一次导入槽磁力分类存量补登记（见
+  /// _ensureQuery）。仅默认装配为 true。
+  final bool _backfillOnOpen;
 
   ActressLibRawQuery? _query;
   String? _openStamp;
@@ -114,6 +123,15 @@ class ActressLibraryDbFallback {
     if (path == null || path.isEmpty) {
       _reset();
       return null;
+    }
+    // 存量补登记（2026-11-28 用户令）：导入槽里有磁力作品却
+    // 没登记的库（旧版走女优库激活路导入的合并库等），打开
+    // 前自动补一次，用户不用重导。只写导入槽、外置兜底库不
+    // 碰，失败不挡开库（兜底类内部已吞错）。补登记会改文件，
+    // 放在文件戳计算之前，戳按补完后的文件算。仅生产默认
+    // 装配启用（见 _backfillOnOpen）。
+    if (_backfillOnOpen) {
+      await ActressMagnetAutoRegistration.backfillImportedSlot();
     }
     final stamp = _stampOf(path) ?? path;
     if (_query != null && _openStamp == stamp) return _query;
@@ -689,71 +707,180 @@ class ActressLibraryDbFallback {
       tables.contains('magnet_libraries') &&
       tables.contains('magnet_library_works');
 
-  /// 磁力分类组（演员库分类栏用）：登记分类名 + 并集去重计数
-  /// （video_category 主分类 ∪ 来源登记，同番号两边都有只
-  /// 数一次，照移植施工图的并集口径）。没登记回空列表。
+  /// 「带磁力线路的作品」子查询谓词（磁力视图的成员尺，与
+  /// _magnetUrls 的判定同口径：play_from = 'magnet' 或地址以
+  /// magnet: 开头；play_from 列不在的库只走地址尺）。没有
+  /// video_play_urls 表回 null（该库无从谈磁力视图）。
+  Future<String?> _magnetUrlScopeSql(
+    ActressLibRawQuery query,
+    Set<String> tables,
+  ) async {
+    if (!tables.contains('video_play_urls')) return null;
+    final playUrlCols = await _columnSet(query, 'video_play_urls');
+    final magnetWhere = playUrlCols.contains('play_from')
+        ? "(LOWER(TRIM(COALESCE(play_from, ''))) = 'magnet' "
+              "OR LOWER(TRIM(play_url)) LIKE 'magnet:%')"
+        : "LOWER(TRIM(play_url)) LIKE 'magnet:%'";
+    return 'v.vod_id IN (SELECT vod_id FROM video_play_urls '
+        'WHERE $magnetWhere)';
+  }
+
+  /// 磁力视图的范围谓词（分类/计数/列表共用一把尺）：成员 =
+  /// 带磁力线路的作品 ∪ 磁力登记作品（登记表在场时）。数据源
+  /// 抽象点在这里：现行导入槽靠登记表 + 磁力线路双尺；将来
+  /// 磁力按女优库字段并入合并库（无登记表）时只剩磁力线路一
+  /// 尺，谓词自动收敛、页面不用改。category 非空时再叠分类：
+  /// 主分类命中且是成员，或登记在本分类下。
+  Future<({String sql, List<Object?> args})> _magnetScope(
+    ActressLibRawQuery query,
+    Set<String> tables, {
+    String category = '',
+  }) async {
+    final hasMagnet = await _magnetUrlScopeSql(query, tables);
+    final hasReg = _hasMagnetTables(tables);
+    final membershipTerms = <String>[
+      if (hasMagnet != null) hasMagnet,
+      if (hasReg) 'v.vod_id IN (SELECT vod_id FROM magnet_library_works)',
+    ];
+    final membership = membershipTerms.isEmpty
+        ? null
+        : '(${membershipTerms.join(' OR ')})';
+    if (category.isEmpty) {
+      return (sql: membership ?? '1=0', args: const <Object?>[]);
+    }
+    final terms = <String>[];
+    final args = <Object?>[];
+    if (membership != null && tables.contains('video_category')) {
+      terms.add(
+        '(v.vod_id IN (SELECT vod_id FROM video_category '
+        'WHERE main_category = ?) AND $membership)',
+      );
+      args.add(category);
+    }
+    if (hasReg) {
+      terms.add(
+        'v.vod_id IN (SELECT mlw.vod_id FROM magnet_library_works mlw '
+        'JOIN magnet_libraries ml ON ml.id = mlw.library_id '
+        'WHERE ml.category = ?)',
+      );
+      args.add(category);
+    }
+    return (
+      sql: terms.isEmpty ? '1=0' : '(${terms.join(' OR ')})',
+      args: args,
+    );
+  }
+
+  /// 磁力分类组（演员库分类栏 + 磁力列表页筛选共用）：分类名
+  /// 与计数同走 _magnetScope 一把尺（计数 = 该分类下磁力成员
+  /// 去重数）。登记表在场且有切片时分类名以登记为准；不在场
+  /// （合并库口径）时从磁力成员的主分类现算。登记表在场但一
+  /// 个切片都没有（别的流程建出的空表、或登记被删空）时不能
+  /// 让空登记把现算堵死——同样落到现算（2026-11-28 补登记批
+  /// 查实：整库导入路不写登记，空表短路是分类不显示的口子
+  /// 之一；正路是导入/打开时把登记补上，见数据层
+  /// ensureAutoRegistered）。
   Future<Map<String, dynamic>> _magnetCategories(
     ActressLibRawQuery query,
     Set<String> tables,
   ) async {
-    if (!_hasMagnetTables(tables)) {
+    if (_hasMagnetTables(tables)) {
+      final rows = await query(
+        'SELECT category AS name FROM magnet_libraries '
+        "WHERE TRIM(category) <> '' GROUP BY category ORDER BY category",
+      );
+      final categories = <Map<String, dynamic>>[];
+      for (final row in rows) {
+        final name = row['name']?.toString() ?? '';
+        if (name.isEmpty) continue;
+        final scope = await _magnetScope(query, tables, category: name);
+        final counted = await query(
+          'SELECT COUNT(DISTINCT vod_id) AS c FROM ('
+          'SELECT v.vod_id AS vod_id FROM videos v WHERE ${scope.sql})',
+          scope.args,
+        );
+        categories.add({
+          'name': name,
+          'count': counted.isEmpty
+              ? 0
+              : (counted.first['c'] as num?)?.toInt() ?? 0,
+        });
+      }
+      if (categories.isNotEmpty) {
+        return {'ok': true, 'categories': categories};
+      }
+      // 空登记：落到下面的现算，不回空列表。
+    }
+    final hasMagnet = await _magnetUrlScopeSql(query, tables);
+    if (hasMagnet == null || !tables.contains('video_category')) {
       return {'ok': true, 'categories': const []};
     }
     final rows = await query(
-      'SELECT category AS name FROM magnet_libraries '
-      "WHERE TRIM(category) <> '' GROUP BY category ORDER BY category",
+      'SELECT vc.main_category AS name, COUNT(DISTINCT vc.vod_id) AS c '
+      'FROM video_category vc JOIN videos v ON v.vod_id = vc.vod_id '
+      "WHERE TRIM(vc.main_category) <> '' AND $hasMagnet "
+      'GROUP BY vc.main_category ORDER BY vc.main_category',
     );
-    final categories = <Map<String, dynamic>>[];
-    for (final row in rows) {
-      final name = row['name']?.toString() ?? '';
-      if (name.isEmpty) continue;
-      final counted = await query(
-        'SELECT COUNT(DISTINCT vod_id) AS c FROM ('
-        'SELECT vod_id FROM video_category WHERE main_category = ? '
-        'UNION SELECT mlw.vod_id FROM magnet_library_works mlw '
-        'JOIN magnet_libraries ml ON ml.id = mlw.library_id '
-        'WHERE ml.category = ?)',
-        [name, name],
-      );
-      categories.add({
-        'name': name,
-        'count': (counted.first['c'] as num?)?.toInt() ?? 0,
-      });
-    }
-    return {'ok': true, 'categories': categories};
+    return {
+      'ok': true,
+      'categories': [
+        for (final row in rows)
+          if ((row['name']?.toString() ?? '').isNotEmpty)
+            {
+              'name': row['name'].toString(),
+              'count': (row['c'] as num?)?.toInt() ?? 0,
+            },
+      ],
+    };
   }
 
-  /// 磁力分类下的作品：谓词走「主分类 ∪ 登记」并集——样本里
-  /// 绝大多数磁力作品与主库同番号、只有登记能把它们归进这
-  /// 个分类，只查 video_category 会漏掉大半。
+  /// 磁力作品列表（演员库磁力分类的数据源；2026-11-28 起
+  /// 磁力不单独成页，这是「带磁力的作品」这一视图的查询）：
+  /// 范围走 _magnetScope（磁力视图：带磁力线路 ∪ 登记）。
+  /// 参数：
+  /// - category 非空 = 单个分类；为空 = 全部磁力作品；
+  /// - q 非空 = 按番号/标题包含搜索（叠加在范围之上）；
+  /// - page/limit 分页同全仓口径。结果带 total（同谓词去重
+  ///   计数），页面显示「共 N 部」与判尾页用。
   Future<Map<String, dynamic>> _magnetWorks(
     ActressLibRawQuery query,
     Set<String> tables,
     Map<String, dynamic> params,
   ) async {
     final category = (params['category'] ?? '').toString().trim();
-    if (category.isEmpty) {
-      return {'ok': false, 'error': '磁力分类为空'};
+    final scope = await _magnetScope(query, tables, category: category);
+    var where = '$_exclusionSql AND ${scope.sql}';
+    final args = <Object?>[..._exclusionArgs, ...scope.args];
+    final q = (params['q'] ?? '').toString().trim();
+    if (q.isNotEmpty) {
+      where +=
+          " AND (v.vod_id LIKE ? ESCAPE '\\' "
+          "OR v.title LIKE ? ESCAPE '\\')";
+      args.add('%${_escapeLike(q.toLowerCase())}%');
+      args.add('%${_escapeLike(q)}%');
     }
-    if (!_hasMagnetTables(tables)) {
-      return {'ok': true, 'items': const []};
+    final counted = await query(
+      'SELECT COUNT(DISTINCT v.vod_id) AS c FROM videos v WHERE $where',
+      args,
+    );
+    final total = counted.isEmpty
+        ? 0
+        : (counted.first['c'] as num?)?.toInt() ?? 0;
+    if (total == 0) {
+      return {'ok': true, 'items': const [], 'total': 0};
     }
     final page = _page(params);
     final limit = _limit(params);
     final items = await _videoRows(
       query,
       tables,
-      where: '$_exclusionSql AND v.vod_id IN ('
-          'SELECT vod_id FROM video_category WHERE main_category = ? '
-          'UNION SELECT mlw.vod_id FROM magnet_library_works mlw '
-          'JOIN magnet_libraries ml ON ml.id = mlw.library_id '
-          'WHERE ml.category = ?)',
-      whereArgs: [..._exclusionArgs, category, category],
+      where: where,
+      whereArgs: args,
       orderBy: 'v.vod_pubdate DESC, v.vod_id DESC',
       limit: limit,
       offset: (page - 1) * limit,
     );
-    return {'ok': true, 'items': items};
+    return {'ok': true, 'items': items, 'total': total};
   }
 
   /// 一批作品的磁力地址（卡片三态徽标合成用）：只回带磁力

@@ -465,29 +465,25 @@ void main() {
       );
     });
 
-    test('一段版本门拒：actress 核心版本不符，只拒该段、别段照常落位', () async {
+    test('段清单版本字段不符：不再单独拒段（版本门只留整库一道），三段照常全落', () async {
+      // 2026-11-28 设计令：站点绑定数据库激活、版本门只留
+      // 整库一道。段 manifest 的 core_version 与整库不一致
+      // 不再是拒收理由（整文件清单的版本已在整库层验过）。
       final outcome = await runImport(
         useFixture: _BundleFixture(actressCoreVersion: '1999.01.01'),
       );
       expect(outcome, isNotNull);
       expect(outcome!.ok, isTrue, reason: outcome.error);
-      final bySegment = {
-        for (final r in outcome.segmentResults) r.segment: r,
-      };
-      expect(bySegment['site']!.ok, isTrue);
-      expect(bySegment['magnet']!.ok, isTrue);
-      expect(bySegment['actress']!.ok, isFalse);
-      expect(bySegment['actress']!.error, contains('1999.01.01'));
-      expect(bySegment['actress']!.error, contains('2026.11.27'));
-      expect(bySegment['actress']!.error, contains('演员库'));
-      expect(actressLanded, isEmpty);
+      expect(outcome.segmentResults.every((r) => r.ok), isTrue);
+      expect(actressLanded, hasLength(1));
       expect(magnetLanded, hasLength(1));
     });
 
-    test('一段 payload 被篡改：magnet 只拒该段', () async {
+    test('一段 payload 被篡改：整库不导、一段不落、错误定位到该段', () async {
       final tampered = _BundleFixture(tamperMagnetDeclaredPayload: true);
       // 夹具的 magnet 清单 payload/签名按篡改值自洽（整文件层
       // 按声明值算也自洽），段内重算对不上才拒——与真篡改同型。
+      // 新口径：一份数据库一次激活，坏一段整库不导。
       final probe = _BundleFakeExecutor(tampered);
       tampered.magnetPayload = await computeBundleSegmentPayload(
         probe,
@@ -496,16 +492,22 @@ void main() {
       );
       final outcome = await runImport(useFixture: tampered);
       expect(outcome, isNotNull);
-      expect(outcome!.ok, isTrue, reason: outcome.error);
+      expect(outcome!.ok, isFalse);
+      expect(outcome.error, contains('磁力库'));
+      expect(outcome.error, contains('哈希'));
       final bySegment = {
         for (final r in outcome.segmentResults) r.segment: r,
       };
       expect(bySegment['magnet']!.ok, isFalse);
       expect(bySegment['magnet']!.error, contains('磁力库'));
-      expect(bySegment['magnet']!.error, contains('哈希'));
-      expect(bySegment['site']!.ok, isTrue);
-      expect(bySegment['actress']!.ok, isTrue);
+      // 本身完好的段也不落位：整库未导入。
+      expect(bySegment['site']!.ok, isFalse);
+      expect(bySegment['actress']!.ok, isFalse);
+      expect(materializer.calls, isEmpty);
+      expect(actressLanded, isEmpty);
       expect(magnetLanded, isEmpty);
+      final siteDbPath = '${tempDir.path}/site_library/site_library.db';
+      expect(await File(siteDbPath).readAsString(), 'OLDDB');
     });
 
     test('整文件签名不对：全拒、一段不落、旧站点库不动', () async {

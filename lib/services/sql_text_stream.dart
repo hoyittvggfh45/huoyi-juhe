@@ -18,29 +18,99 @@ import 'dart:convert';
 /// LineSplitter 对 \r\n 的处理一致）。内存里至多攒一行，
 /// 流式口径不变（.dump 的行长有界；无换行的病态文件会攒整
 /// 份，与旧 LineSplitter 的行为同级）。
+///
+/// 第二轮（2026-11-28）：逐行解码失败时抛 [SqlDecodeFailure]，
+/// 带行号、行首在文件中的字节偏移、出错字节的文件偏移与出错
+/// 点前后字节的十六进制，供 import_debug.log 定点——真机再
+/// 失败时不用靠猜是哪一层、哪一段、哪个字节。
 Stream<String> sqlTextLines(Stream<List<int>> bytes) async* {
   final pending = <int>[];
+  var lineNumber = 0;
+  var lineStartOffset = 0;
+  var consumed = 0;
   await for (final chunk in bytes) {
     var start = 0;
     while (start < chunk.length) {
       final nl = chunk.indexOf(0x0A, start);
       if (nl < 0) break;
       if (nl > start) pending.addAll(chunk.sublist(start, nl));
-      yield _decodeSqlLine(pending);
+      lineNumber++;
+      yield _decodeSqlLine(pending, lineNumber, lineStartOffset);
       pending.clear();
+      consumed += nl - start + 1;
+      lineStartOffset = consumed;
       start = nl + 1;
     }
-    if (start < chunk.length) pending.addAll(chunk.sublist(start));
+    if (start < chunk.length) {
+      pending.addAll(chunk.sublist(start));
+      consumed += chunk.length - start;
+    }
   }
-  if (pending.isNotEmpty) yield _decodeSqlLine(pending);
+  if (pending.isNotEmpty) {
+    lineNumber++;
+    yield _decodeSqlLine(pending, lineNumber, lineStartOffset);
+  }
 }
 
-String _decodeSqlLine(List<int> lineBytes) {
+/// 逐行 UTF-8 解码失败（第二轮新增）：仍是 FormatException，
+/// 既有的中文化映射照常命中；额外携带定点信息。
+class SqlDecodeFailure implements FormatException {
+  SqlDecodeFailure({
+    required this.message,
+    required this.lineNumber,
+    required this.lineStartOffset,
+    required this.offset,
+    required this.contextHex,
+  });
+
+  @override
+  final String message;
+
+  /// 第几行（从 1 数）。
+  final int lineNumber;
+
+  /// 这一行第一个字节在文件（解压后字节流）中的偏移。
+  final int lineStartOffset;
+
+  /// 出错字节在文件（解压后字节流）中的偏移。
+  @override
+  final int offset;
+
+  /// 出错点前后各 32 字节的十六进制（空格分隔）。
+  final String contextHex;
+
+  @override
+  dynamic get source => null;
+
+  @override
+  String toString() =>
+      'SqlDecodeFailure: $message (at line $lineNumber, '
+      'file offset $offset)';
+}
+
+String _decodeSqlLine(List<int> lineBytes, int lineNumber, int lineStart) {
   var bytes = lineBytes;
   if (bytes.isNotEmpty && bytes.last == 0x0D) {
     bytes = bytes.sublist(0, bytes.length - 1);
   }
-  return utf8.decode(bytes);
+  try {
+    return utf8.decode(bytes);
+  } on FormatException catch (e) {
+    final at = (e.offset ?? 0).clamp(0, bytes.length);
+    final from = (at - 32).clamp(0, bytes.length);
+    final to = (at + 32).clamp(0, bytes.length);
+    final hex = [
+      for (var i = from; i < to; i++)
+        bytes[i].toRadixString(16).padLeft(2, '0'),
+    ].join(' ');
+    throw SqlDecodeFailure(
+      message: e.message,
+      lineNumber: lineNumber,
+      lineStartOffset: lineStart,
+      offset: lineStart + at,
+      contextHex: hex,
+    );
+  }
 }
 
 /// 导入失败给用户看的中文原因：解码类异常（FormatException，

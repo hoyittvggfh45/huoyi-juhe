@@ -104,7 +104,7 @@ void main() {
   });
 
   group('ActressDbSource 激活与生效路径', () {
-    test('只有外置文件：未激活、生效路径为空（外置只是导入来源）', () async {
+    test('只有外置文件：未激活但外置兜底生效（2026-11-28 兜底令）', () async {
       File(externalDb).writeAsStringSync('EXT');
       final source = fakeSource(
         externalPath: externalDb,
@@ -113,12 +113,51 @@ void main() {
       final status = await source.status();
       expect(status.activated, isFalse);
       expect(status.activation, isNull);
-      expect(status.effectivePath, '');
-      expect(await source.effectiveDbPath(), '');
+      // 兜底：外置在且结构探针过关（假计数 42>0）→ 只读生效。
+      expect(status.fallbackActive, isTrue);
+      expect(status.fellBack, isTrue);
+      expect(status.effectivePath, externalDb);
+      expect(await source.effectiveDbPath(), externalDb);
       expect(status.external.exists, isTrue);
       expect(status.imported.exists, isFalse);
-      expect(status.isEffective(ActressDbSlot.external), isFalse);
+      expect(status.isEffective(ActressDbSlot.external), isTrue);
       expect(status.isEffective(ActressDbSlot.imported), isFalse);
+      expect(status.hasUsableLibrary, isTrue);
+    });
+
+    test('兜底不生效：外置结构不过关（作品数 0）→ 回未激活引导', () async {
+      File(externalDb).writeAsStringSync('EXT');
+      final source = fakeSource(
+        externalPath: externalDb,
+        importedPath: importedDb,
+        works: 0,
+      );
+      final status = await source.status();
+      expect(status.activated, isFalse);
+      expect(status.fallbackActive, isFalse);
+      expect(status.effectivePath, '');
+      expect(await source.effectiveDbPath(), '');
+      expect(status.hasUsableLibrary, isFalse);
+    });
+
+    test('兜底退场：导入库被激活后接管、外置不再生效', () async {
+      File(externalDb).writeAsStringSync('EXT');
+      final source = fakeSource(
+        externalPath: externalDb,
+        importedPath: importedDb,
+      );
+      var status = await source.status();
+      expect(status.fallbackActive, isTrue);
+      expect(status.effectivePath, externalDb);
+      // 模拟导入成功：导入库落地＋落激活记录。
+      File(importedDb).writeAsStringSync('IMP');
+      await source.markActivated(origin: 'import');
+      status = await source.status();
+      expect(status.activated, isTrue);
+      expect(status.fallbackActive, isFalse);
+      expect(status.effectivePath, importedDb);
+      expect(status.isEffective(ActressDbSlot.imported), isTrue);
+      expect(status.isEffective(ActressDbSlot.external), isFalse);
     });
 
     test('存量过渡：导入库在、无激活记录 → legacy 补记并生效，重启仍在', () async {
@@ -343,7 +382,7 @@ void main() {
       expect(File('$importedDb.importing-db').existsSync(), isFalse);
     });
 
-    test('核心版本对不上被拒：imported 不动', () async {
+    test('核心版本是未来值 2099 也照常导入（2026-11-28 取消核心门）', () async {
       File(importedDb).writeAsStringSync('OLDIMP');
       final picked = File('${tempDir.path}/future.db')
         ..writeAsStringSync('FUTUREDB');
@@ -354,8 +393,8 @@ void main() {
       const futureInfo = ActressLibraryVersionInfo(
         format: 'actress_library',
         formatVersion: '1',
-        coreVersion: '2027.01.01',
-        libraryVersion: '20270101',
+        coreVersion: '2099.01.01',
+        libraryVersion: '20990101',
       );
       final outcome = await serviceWith(
         source,
@@ -365,10 +404,9 @@ void main() {
           error: actressLibraryVersionError(futureInfo),
         ),
       ).importLocalFile(localPath: picked.path, closeDatabase: () async {});
-      expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('要求核心版本 2027.01.01'));
-      expect(outcome.error, contains('2026.11.27'));
-      expect(File(importedDb).readAsStringSync(), 'OLDIMP');
+      expect(outcome.ok, isTrue);
+      expect(outcome.error, isNull);
+      expect(File(importedDb).readAsStringSync(), 'FUTUREDB');
     });
 
     test('不支持的后缀直接拒绝', () async {
@@ -486,7 +524,9 @@ void main() {
       expect(status.activation?.origin, 'legacy');
     });
 
-    test('外置版本字段在但对不上：仍拒、imported 不落地', () async {
+    test('外置格式版本对不上：仍拒、imported 不落地', () async {
+      // 「对不上」的触发条件 2026-11-28 起只剩格式版本（核心
+      // 版本已取消设门，写什么都不拒）。
       File(externalDb).writeAsStringSync('EXTDB');
       final source = fakeSource(
         externalPath: externalDb,
@@ -494,7 +534,7 @@ void main() {
       );
       const info = ActressLibraryVersionInfo(
         format: actressLibraryMetaFormat,
-        formatVersion: '1',
+        formatVersion: '2',
         coreVersion: '1999.01.01',
         libraryVersion: 'x',
       );
@@ -511,7 +551,7 @@ void main() {
         closeDatabase: () async {},
       );
       expect(outcome.ok, isFalse);
-      expect(outcome.error, contains('版本对不上'));
+      expect(outcome.error, contains('格式版本 2'));
       expect(File(importedDb).existsSync(), isFalse);
     });
   });
@@ -533,6 +573,7 @@ void main() {
       bool withImported = true,
       ActressDbVersionChecker? versionChecker,
       int serviceWorks = 1,
+      int sourceWorks = 42,
     }) async {
       // 组装接缝（20261127+3）：管理页新增站点库区后整页变高，
       // 默认 800x600 视口下双库卡片落到折叠线以下、ListView 不
@@ -546,6 +587,7 @@ void main() {
       final source = fakeSource(
         externalPath: externalDb,
         importedPath: importedDb,
+        works: sourceWorks,
       );
       await tester.pumpWidget(
         MaterialApp(
@@ -590,15 +632,29 @@ void main() {
       expect(find.byKey(const ValueKey('dual-import-button')), findsOneWidget);
     });
 
-    testWidgets('未激活态：引导出现、外置卡可导入、两卡都无当前标记', (tester) async {
+    testWidgets('未激活＋外置过关：兜底态明示、当前标记在外置卡', (tester) async {
       await pumpPage(tester, withImported: false);
+      expect(find.byKey(const ValueKey('activation-guide')), findsOneWidget);
+      expect(find.textContaining('当前使用外置库兜底（只读）'), findsWidgets);
+      expect(find.byKey(const ValueKey('dual-import-external')), findsOneWidget);
+      expect(find.byKey(const ValueKey('dual-current-imported')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('dual-current-external')),
+        findsOneWidget,
+      );
+      expect(find.textContaining('激活：未激活（当前由外置库兜底'), findsOneWidget);
+      // 导入库不存在：没有删除钮。
+      expect(find.byKey(const ValueKey('dual-delete-imported')), findsNothing);
+    });
+
+    testWidgets('未激活＋外置不过关：回引导态、两卡都无当前标记', (tester) async {
+      await pumpPage(tester, withImported: false, sourceWorks: 0);
       expect(find.byKey(const ValueKey('activation-guide')), findsOneWidget);
       expect(find.textContaining('演员库还没激活'), findsWidgets);
       expect(find.byKey(const ValueKey('dual-import-external')), findsOneWidget);
       expect(find.byKey(const ValueKey('dual-current-imported')), findsNothing);
       expect(find.byKey(const ValueKey('dual-current-external')), findsNothing);
       expect(find.textContaining('激活：未激活'), findsOneWidget);
-      // 导入库不存在：没有删除钮。
       expect(find.byKey(const ValueKey('dual-delete-imported')), findsNothing);
     });
 
@@ -631,11 +687,11 @@ void main() {
       expect(status.activation!.origin, 'import');
     });
 
-    testWidgets('点导入激活被版本门拒（字段在但对不上）：中文原因上屏、仍未激活',
+    testWidgets('点导入激活被版本门拒（格式版本对不上）：中文原因上屏、仍未激活',
         (tester) async {
       const info = ActressLibraryVersionInfo(
         format: actressLibraryMetaFormat,
-        formatVersion: '1',
+        formatVersion: '2',
         coreVersion: '1999.01.01',
         libraryVersion: 'x',
       );
@@ -652,7 +708,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 50));
       await tester.pump();
       expect(find.byKey(const ValueKey('dual-error')), findsOneWidget);
-      expect(find.textContaining('版本对不上'), findsWidgets);
+      expect(find.textContaining('格式版本 2'), findsWidgets);
       expect(find.byKey(const ValueKey('activation-guide')), findsOneWidget);
       expect(find.byKey(const ValueKey('dual-current-imported')), findsNothing);
     });

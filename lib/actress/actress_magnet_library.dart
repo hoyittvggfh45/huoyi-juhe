@@ -4,6 +4,7 @@ import 'package:path/path.dart' as path;
 import 'package:sqflite/sqflite.dart';
 
 import 'actress_db_import.dart';
+import 'actress_db_source.dart';
 import 'actress_sql_import.dart';
 
 /// 磁力分类库（移植自魔蚁 d0ef96f，落法按修仙版双库架构调整）：
@@ -141,6 +142,29 @@ class MagnetImportOutcome {
 
   /// 同名分类已存在、这次是更新（先删旧登记再并入）。
   final bool replaced;
+}
+
+/// 自动补登记的结果（整库导入/打开存量库时用，见
+/// [ActressMagnetLibraryStore.ensureAutoRegistered]）。
+class MagnetAutoRegisterOutcome {
+  const MagnetAutoRegisterOutcome({
+    required this.changed,
+    this.addedSlices = const [],
+    this.registeredWorks = 0,
+    this.registeredMagnetUrls = 0,
+  });
+
+  /// 这次有没有新建切片（false = 本来就齐 / 不需要登记）。
+  final bool changed;
+
+  /// 这次新建的分类切片名（含兜底片，若有）。
+  final List<String> addedSlices;
+
+  /// 这次登记的作品总数（只算新建切片名下的）。
+  final int registeredWorks;
+
+  /// 这次登记的磁力线路总数（只算新建切片名下的）。
+  final int registeredMagnetUrls;
 }
 
 /// 删库的结果。
@@ -701,6 +725,223 @@ class ActressMagnetLibraryStore {
     );
   }
 
+  Future<bool> _columnExists(
+    DatabaseExecutor db,
+    String table,
+    String column,
+  ) async {
+    // 表名只来自本文件内的固定字面量，无注入面。
+    final rows = await db.rawQuery(
+      "SELECT name FROM pragma_table_info('$table')",
+    );
+    return rows.any((row) => row['name']?.toString() == column);
+  }
+
+  /// 自动补登记（2026-11-28 用户令「修复导入数据库要登记自动
+  /// 显示这些32个分类」）：整库导入（女优库 .db/.sql、合并文件
+  /// 演员段）落进导入槽的库，自带磁力作品与主分类，却没有磁力
+  /// 登记——合并库就是这个形态。演员库分类栏与管理页登记列表
+  /// 都读登记表，没登记就什么都不显示（用户实况）。本方法从
+  /// 目标库自身数据派生登记：切片 = 库内全部主分类（video_
+  /// category 去重非空）＋无分类磁力作品的兜底片（名按来源
+  /// 文件名取，缺省「未分类」；兜底名与真分类同名时并进那个
+  /// 真分类片，与 [mergeStaging] 同口径）；每片只登记该分类
+  /// 下**带磁力线路的作品**（两道尺，与查询层成员尺一致）、
+  /// 这些作品的磁力线路、关联演员与分类行。成员只认磁力作
+  /// 品这一条与 mergeStaging 不同，是有意的：mergeStaging
+  /// 的临时库本身就是磁力合集、作品全是合集成员；本方法面
+  /// 对的是整本女优库，若按分类把全部作品登记进来，磁力分
+  /// 类计数会吞掉整库（与无登记时查询层按磁力线路现算的口
+  /// 径打架）。无磁力作品的分类也照样建片（计数 0），保证
+  /// 分类齐现——合并库实测对账：31 个主分类＋兜底片共 32
+  /// 片、登记磁力作品 94,699 部、磁力线路 99,301 条。
+  ///
+  /// 只补缺：登记表里已有的同名切片（磁力文件正经导入登记
+  /// 的）一律不动；已齐时整件跳过（幂等，重复调用无副作用）。
+  /// 登记行 was_existing 全记 1——这些作品与线路本来就是这本
+  /// 库自带的，不是哪个磁力文件「带来」的：日后按勾选删这个
+  /// 分类，删库语义只摘登记、本库作品与线路一条不动。
+  ///
+  /// 触发门：标准表不全（通用结构库等）或库里一条磁力线路
+  /// 都没有（纯女优库）→ 直接跳过，不建登记表、不生分类。
+  Future<MagnetAutoRegisterOutcome> ensureAutoRegistered(
+    Database db, {
+    String sourceName = '',
+  }) async {
+    for (final table in ['videos', 'video_category', 'video_play_urls']) {
+      if (!await _tableExists(db, table)) {
+        return const MagnetAutoRegisterOutcome(changed: false);
+      }
+    }
+    if (await _magnetUrlCount(db) == 0) {
+      return const MagnetAutoRegisterOutcome(changed: false);
+    }
+    await ensureMagnetLibraryTables(db);
+    final existingRows = await db.query('magnet_libraries', columns: ['name']);
+    final existing = {
+      for (final row in existingRows) row['name'].toString(),
+    };
+    final categoryRows = await db.rawQuery(
+      'SELECT main_category FROM video_category '
+      "WHERE TRIM(COALESCE(main_category, '')) <> '' "
+      'GROUP BY main_category ORDER BY main_category',
+    );
+    final namedSlices = [
+      for (final row in categoryRows) row['main_category'].toString(),
+    ];
+    // 磁力作品谓词（两道尺，与查询层 _magnetUrlScopeSql 同
+    // 口径）：登记成员只认带磁力线路的作品。
+    final hasPlayFrom = await _columnExists(db, 'video_play_urls', 'play_from');
+    final magnetWork =
+        'EXISTS (SELECT 1 FROM video_play_urls u '
+        'WHERE u.vod_id = v.vod_id AND '
+        "(LOWER(TRIM(u.play_url)) LIKE 'magnet:%'"
+        "${hasPlayFrom ? " OR LOWER(TRIM(COALESCE(u.play_from, ''))) = 'magnet'" : ''}))";
+    final uncategorizedRows = await db.rawQuery(
+      'SELECT COUNT(*) AS c FROM videos v '
+      'LEFT JOIN video_category c ON c.vod_id = v.vod_id '
+      "WHERE (c.vod_id IS NULL "
+      "OR TRIM(COALESCE(c.main_category, '')) = '') "
+      'AND $magnetWork',
+    );
+    final hasUncategorized =
+        ((uncategorizedRows.first['c'] as num?)?.toInt() ?? 0) > 0;
+    // 兜底片名按来源文件名取并剥常见后缀（magnetLibraryName
+    // OfFile 剥 .sql/.gz 但不剥 .db，这里补上，免得片名带个
+    // 「.db」尾巴）；来源名缺省时就叫「未分类」。
+    var sourceBase = sourceName.trim();
+    if (sourceBase.toLowerCase().endsWith('.db')) {
+      sourceBase = sourceBase.substring(0, sourceBase.length - 3);
+    }
+    final fallbackName = sourceBase.isEmpty
+        ? '未分类'
+        : magnetLibraryNameOfFile(sourceBase);
+    // 兜底名撞真分类名：并进那个真分类片（它若已登记则守
+    // 「已有不动」，无分类作品这次不补）；撞已登记的其它名
+    // 字同样不补兜底片。
+    final foldInto = hasUncategorized && namedSlices.contains(fallbackName)
+        ? fallbackName
+        : null;
+    final toCreate = <String>[
+      for (final name in namedSlices)
+        if (!existing.contains(name)) name,
+    ];
+    final createFallback =
+        hasUncategorized &&
+        foldInto == null &&
+        !existing.contains(fallbackName);
+    if (toCreate.isEmpty && !createFallback) {
+      return const MagnetAutoRegisterOutcome(changed: false);
+    }
+    var registeredWorks = 0;
+    var registeredUrls = 0;
+    final added = <String>[];
+    await db.transaction((txn) async {
+      await ensureMagnetLibraryTables(txn);
+      // 事务内复查已登记集，防并发重复建同名片撞 UNIQUE。
+      final nowRows = await txn.query('magnet_libraries', columns: ['name']);
+      final nowExisting = {
+        for (final row in nowRows) row['name'].toString(),
+      };
+      final importedAt = DateTime.now().millisecondsSinceEpoch;
+      final hasActressLink = await _tableExists(txn, 'video_actress');
+      for (final slice in [
+        ...toCreate,
+        if (createFallback) fallbackName,
+      ]) {
+        if (nowExisting.contains(slice)) continue;
+        final libraryId = await txn.insert('magnet_libraries', {
+          'name': slice,
+          'category': slice,
+          'source_name': sourceName,
+          'imported_at': importedAt,
+        });
+        final isFallback = createFallback && slice == fallbackName;
+        if (!isFallback) {
+          await txn.execute(
+            'INSERT OR IGNORE INTO magnet_library_works '
+            '(library_id, vod_id, was_existing) '
+            'SELECT ?, v.vod_id, 1 FROM videos v '
+            'JOIN video_category c ON c.vod_id = v.vod_id '
+            'WHERE c.main_category = ? AND $magnetWork',
+            [libraryId, slice],
+          );
+        }
+        if (isFallback || slice == foldInto) {
+          await txn.execute(
+            'INSERT OR IGNORE INTO magnet_library_works '
+            '(library_id, vod_id, was_existing) '
+            'SELECT ?, v.vod_id, 1 FROM videos v '
+            'LEFT JOIN video_category c ON c.vod_id = v.vod_id '
+            "WHERE (c.vod_id IS NULL "
+            "OR TRIM(COALESCE(c.main_category, '')) = '') "
+            'AND $magnetWork',
+            [libraryId],
+          );
+        }
+        // 线路登记只记磁力线路（两道尺，与计数口径一致）：
+        // 普通线路不是磁力库带来的，不进登记。
+        await txn.execute(
+          'INSERT OR IGNORE INTO magnet_library_play_urls '
+          '(library_id, vod_id, play_url, was_existing) '
+          'SELECT ?, w.vod_id, u.play_url, 1 '
+          'FROM magnet_library_works w '
+          'JOIN video_play_urls u ON u.vod_id = w.vod_id '
+          'WHERE w.library_id = ? AND '
+          "(LOWER(TRIM(u.play_url)) LIKE 'magnet:%'"
+          "${hasPlayFrom ? " OR LOWER(TRIM(COALESCE(u.play_from, ''))) = 'magnet'" : ''})",
+          [libraryId, libraryId],
+        );
+        if (hasActressLink) {
+          await txn.execute(
+            'INSERT OR IGNORE INTO magnet_library_actresses '
+            '(library_id, cate_id, was_existing) '
+            'SELECT ?, va.cate_id, 1 '
+            'FROM (SELECT DISTINCT cate_id, vod_id '
+            'FROM video_actress) va '
+            'JOIN magnet_library_works w '
+            'ON w.library_id = ? AND w.vod_id = va.vod_id',
+            [libraryId, libraryId],
+          );
+        }
+        await txn.execute(
+          'INSERT OR IGNORE INTO magnet_library_categories '
+          '(library_id, vod_id, main_category, was_existing) '
+          'SELECT ?, c.vod_id, c.main_category, 1 '
+          'FROM video_category c '
+          'JOIN magnet_library_works w '
+          'ON w.library_id = ? AND w.vod_id = c.vod_id',
+          [libraryId, libraryId],
+        );
+        final works = await _countWhere(
+          txn,
+          'magnet_library_works',
+          libraryId,
+        );
+        final urls = await _countWhere(
+          txn,
+          'magnet_library_play_urls',
+          libraryId,
+        );
+        await txn.update(
+          'magnet_libraries',
+          {'works': works, 'play_urls': urls},
+          where: 'id = ?',
+          whereArgs: [libraryId],
+        );
+        registeredWorks += works;
+        registeredUrls += urls;
+        added.add(slice);
+      }
+    });
+    return MagnetAutoRegisterOutcome(
+      changed: added.isNotEmpty,
+      addedSlices: added,
+      registeredWorks: registeredWorks,
+      registeredMagnetUrls: registeredUrls,
+    );
+  }
+
   /// 已登记的磁力分类名（去重、非空）：演员库分类栏的磁力
   /// 分类组数据源。登记表不在（还没导入过）回空。
   Future<List<String>> magnetCategories(Database db) async {
@@ -824,3 +1065,66 @@ Future<MagnetStagingOutcome> buildMagnetStagingDb(
 /// staging 文件与目标库同目录时的缺省名（与魔蚁同名口径）。
 String magnetStagingPathFor(String targetDbPath) =>
     path.join(path.dirname(targetDbPath), '.magnet-staging.db');
+
+/// 打开一个库文件跑自动补登记（整库导入尾段用）：开读写连接
+/// → [ActressMagnetLibraryStore.ensureAutoRegistered] → 关连
+/// 接。失败原样抛给调用方决定（导入尾段记警告、打开兜底吞
+/// 掉）。[openDb] 仅供测试注入，生产走 sqflite 本体。
+Future<MagnetAutoRegisterOutcome> autoRegisterMagnetCategoriesInDbFile(
+  String dbPath, {
+  String sourceName = '',
+  Future<Database> Function(String path)? openDb,
+}) async {
+  final db = await (openDb ??
+      (p) => openDatabase(p, singleInstance: false))(dbPath);
+  try {
+    return await const ActressMagnetLibraryStore().ensureAutoRegistered(
+      db,
+      sourceName: sourceName,
+    );
+  } finally {
+    await db.close();
+  }
+}
+
+/// 打开演员库时的存量补登记（2026-11-28 用户令的「已导入」
+/// 路）：导入槽里的库若有磁力作品却没登记（例如旧版走女优库
+/// 激活路导入的合并库，用户实况），读库层打开它之前自动补一
+/// 次，用户不用重导。只写导入槽文件——外置库永不写（生效路
+/// 径是外置兜底时也不碰它）。按文件戳在本进程内只试一次
+/// （补完文件戳会变、新戳下再查一次、查到已齐即跳过）；任何
+/// 失败都吞掉，绝不挡读库。
+class ActressMagnetAutoRegistration {
+  ActressMagnetAutoRegistration._();
+
+  static String? _attemptedStamp;
+
+  /// 测试用：清掉进程内已试戳记。
+  static void resetForTest() => _attemptedStamp = null;
+
+  static Future<void> backfillImportedSlot({
+    ActressDbSource? source,
+    Future<Database> Function(String path)? openDb,
+  }) async {
+    try {
+      final src = source ?? ActressDbSource.instance;
+      final importedPath = await src.importedDbPath();
+      if (importedPath.isEmpty) return;
+      final file = File(importedPath);
+      if (!file.existsSync() || file.lengthSync() == 0) return;
+      final stat = file.statSync();
+      final stamp =
+          '$importedPath|${stat.size}|'
+          '${stat.modified.millisecondsSinceEpoch}';
+      if (_attemptedStamp == stamp) return;
+      _attemptedStamp = stamp;
+      await autoRegisterMagnetCategoriesInDbFile(
+        importedPath,
+        openDb: openDb,
+      );
+    } catch (_) {
+      // 补登记是兜底动作：失败不挡演员库打开；文件再变化
+      // （重导/换库）时还会再试。
+    }
+  }
+}

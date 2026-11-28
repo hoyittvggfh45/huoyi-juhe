@@ -669,11 +669,20 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
         .timeout(const Duration(seconds: 20));
     if (detail['ok'] != true || detail['item'] is! Map) return null;
     final item = Map<String, dynamic>.from(detail['item'] as Map);
-    final urls = [
-      for (final row in (item['playUrls'] as List? ?? const []))
-        row.toString(),
+    // 库内磁力一并收割（2026-11-28 验收线：哪个入口进来、只
+    // 要番号在库里挂有磁力，详情页就必须显示磁力区）：在线/
+    // 按番号入口原本只取播放线路，磁力区永远是空的，这里补
+    // 上——与本地入口同一份 detail 数据、同一判定，不另查。
+    // 作品可能只有磁力没有播放线路，所以收割放在线路判空
+    // 之前。
+    final magnets = [
+      for (final row in (item['magnetUrls'] as List? ?? const []))
+        if (row.toString().isNotEmpty) row.toString(),
     ];
-    if (urls.isEmpty) return null;
+    if (magnets.isNotEmpty && _dbMagnets.isEmpty && mounted) {
+      setState(() => _dbMagnets = magnets);
+      unawaited(_resolveDbMagnetState());
+    }
     if (_mayLike.isEmpty) {
       setState(() {
         _mayLike = [
@@ -682,6 +691,11 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
         ];
       });
     }
+    final urls = [
+      for (final row in (item['playUrls'] as List? ?? const []))
+        row.toString(),
+    ];
+    if (urls.isEmpty) return null;
     return ActressPlayTarget(urls.first);
   }
 
@@ -1171,6 +1185,13 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
     } catch (_) {
       // 三态读不到就不贴副标，磁力行照常能点播。
     }
+  }
+
+  /// 复制一条磁力链接（行内复制钮与长按共用）。
+  Future<void> _copyDbMagnet(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (!mounted) return;
+    _snack('磁力链接已复制');
   }
 
   /// 库内磁力行点播：与 JavDB 磁力同一条 MagnetPlayWaiter
@@ -2591,13 +2612,7 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
               onTap: _magnetPlayProgress != null
                   ? null
                   : () => unawaited(_startDbMagnetPlay(_dbMagnets[i])),
-              onLongPress: () async {
-                await Clipboard.setData(
-                  ClipboardData(text: _dbMagnets[i]),
-                );
-                if (!mounted) return;
-                _snack('磁力链接已复制');
-              },
+              onLongPress: () => unawaited(_copyDbMagnet(_dbMagnets[i])),
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 9),
                 child: Column(
@@ -2621,6 +2636,26 @@ class _ActressWorkDetailPageState extends State<ActressWorkDetailPage> {
                               fontSize: 12.5,
                             ),
                           ),
+                        ),
+                        // 显式复制钮（2026-11-28 验收线「点按复
+                        // 制」）：不用长按也能一眼看到能复制，
+                        // 与点行走 115 播放并存。
+                        IconButton(
+                          key: ValueKey('work-detail-db-magnet-copy-$i'),
+                          icon: const Icon(
+                            Icons.copy_outlined,
+                            size: 16,
+                            color: Neon.textDim,
+                          ),
+                          tooltip: '复制磁力链接',
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 30,
+                            minHeight: 30,
+                          ),
+                          onPressed: () =>
+                              unawaited(_copyDbMagnet(_dbMagnets[i])),
                         ),
                         const Icon(
                           Icons.play_circle_outline_rounded,

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:sqflite/sqflite.dart';
 
+import '../services/import_debug_log.dart';
 import '../services/sql_text_stream.dart';
 import 'actress_generic_db.dart';
 import 'actress_library_version.dart';
@@ -313,6 +314,7 @@ class ActressSqlImporter {
       );
     }
     final totalBytes = await sqlFile.length();
+    await ImportDebugLog.reset('女优库/磁力库 SQL 文件 $sqlPath');
     final tempPath = '$dbPath.importing';
     final tempFile = File(tempPath);
     try {
@@ -537,10 +539,15 @@ class ActressSqlImporter {
         error: '已取消，数据库未改动',
         needsReload: closedDb,
       );
-    } catch (e) {
+    } catch (e, stack) {
+      await ImportDebugLog.record(
+        stage: '女优库/磁力库 SQL 导入（staging/归一化/校验）',
+        error: e,
+        stack: stack,
+      );
       return ActressSqlImportResult(
         ok: false,
-        error: '导入失败：${importFailureZh(e)}',
+        error: '导入失败（女优库导入）：${importFailureZh(e)}',
         needsReload: closedDb,
       );
     } finally {

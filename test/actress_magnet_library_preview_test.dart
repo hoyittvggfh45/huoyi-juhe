@@ -1,7 +1,8 @@
 // 磁力分类库（修仙版移植）界面预览截图：一测一张，输出 PNG 到
 // ~/workspace/xiuxian_magnet_library_20261127/previews/。
 // 三张：演员库磁力分类栏、磁力分类作品卡三态徽标、管理页磁力
-// 分类库区。数据是假库 + 假解析器（任务/已提交表注入），不走
+// 状态行（2026-11-28 起磁力并入数据库状态、不再单列区块）。
+// 数据是假库 + 假解析器（任务/已提交表注入），不走
 // 真网、不开真 sqflite（与仓内既有预览同口径）。
 // 跑法：单独跑本文件、--no-pub，不要与功能测试混链。
 import 'dart:io';
@@ -221,7 +222,7 @@ void main() {
     await _savePng(tester, 'preview_magnet_card_states.png');
   });
 
-  testWidgets('preview manage magnet section', (tester) async {
+  testWidgets('preview manage magnet merged status', (tester) async {
     final tempDir = Directory.systemTemp.createTempSync('magnet_preview_');
     addTearDown(() => tempDir.deleteSync(recursive: true));
     final externalDb = '${tempDir.path}/external.db';
@@ -281,14 +282,19 @@ void main() {
     );
     await _settle(tester);
     await tester.scrollUntilVisible(
-      find.byKey(const ValueKey('magnet-library-section')),
+      find.byKey(const ValueKey('magnet-merged-status')),
       240,
     );
     await _settle(tester);
-    expect(find.text('磁力分类库'), findsOneWidget);
-    expect(find.text('4K原版'), findsOneWidget);
-    expect(find.text('96364 部 · 来源 磁力库.sql'), findsOneWidget);
-    expect(find.text('国产原创'), findsOneWidget);
-    await _savePng(tester, 'preview_manage_magnet_section.png');
+    // 2026-11-28 新口径：管理页不再有独立「磁力分类库」区块，
+    // 磁力状态只跟随数据库一行带出（2 个分类 · 登记作品
+    // 96364+128 部），没有逐库列表与删除钮。
+    expect(find.byKey(const ValueKey('magnet-library-section')), findsNothing);
+    expect(find.text('磁力分类库'), findsNothing);
+    expect(
+      find.text('磁力已随数据库生效：2 个分类 · 登记作品 96492 部（磁力链接在演员库作品详情里看）'),
+      findsOneWidget,
+    );
+    await _savePng(tester, 'preview_manage_magnet_merged_status.png');
   });
 }

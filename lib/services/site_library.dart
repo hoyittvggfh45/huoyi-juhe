@@ -7,6 +7,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
+import 'import_debug_log.dart';
 import 'live_sources.dart';
 import 'public_folder.dart';
 import 'site_library_bundle.dart';
@@ -32,8 +33,8 @@ const siteLibrarySignKey = 'xiuxian-site-library-v1';
 /// 本软件支持的站点库格式版本（manifest.format_version 必须等于它）。
 const siteLibrarySupportedFormatVersion = '1';
 
-/// 本软件的核心版本（manifest.core_version 必须等于它）。
-/// 可由 SiteLibraryService 构造注入覆盖（测试/将来升版用）。
+/// 本软件的核心版本。2026-11-28 取消核心门后只作留痕（生成
+/// 清单时写下、验签 payload 覆盖），不再与库里的值比对。
 const siteLibraryDefaultCoreVersion = '2026.11.27';
 
 /// ext 直带上限：超过这个长度的 ext 落盘成文件，条目里只留路径。
@@ -380,7 +381,7 @@ class SiteLibraryImporter {
 
   final int batchSize;
 
-  /// 版本门：manifest.core_version 必须等于它（当前软件核心版本）。
+  /// 兼容保留字段：取消核心门后不再参与比对（见文件头常量）。
   final String currentCoreVersion;
 
   /// 版本门：manifest.format_version 必须等于它。
@@ -420,6 +421,7 @@ class SiteLibraryImporter {
       );
     }
     final totalBytes = await sqlFile.length();
+    await ImportDebugLog.reset('站点数据文件（单段） $sqlPath');
     final tempPath = '$dbPath.importing';
     final tempFile = File(tempPath);
     try {
@@ -561,10 +563,15 @@ class SiteLibraryImporter {
         ok: false,
         error: '已取消，数据库未改动',
       );
-    } catch (e) {
+    } catch (e, stack) {
+      await ImportDebugLog.record(
+        stage: '站点数据导入（单段文件路）',
+        error: e,
+        stack: stack,
+      );
       return SiteLibraryImportOutcome(
         ok: false,
-        error: '导入失败：${importFailureZh(e)}',
+        error: '导入失败（站点数据导入）：${importFailureZh(e)}',
       );
     } finally {
       try {
@@ -682,19 +689,16 @@ class SiteLibraryImporter {
       throw StateError('站点库签名不对，已拒绝');
     }
     // 版本门（与哈希/验签同层）：签名验过说明版本字段是生成器
-    // 原样写下的，此时版本对不上就是库与软件不配套，整库拒、
-    // 原因写明两边版本。放在验签之后，篡改版本字段会先死在
-    // payload 对不上那一步。
+    // 原样写下的，此时格式版本对不上就是库与软件不配套，整库
+    // 拒、原因写明两边版本。放在验签之后，篡改版本字段会先死
+    // 在 payload 对不上那一步。
+    // 核心版本不再设门（2026-11-28 13:25 用户令「取消这
+    // 个」）：coreVersion 带什么值都不拒，只随清单留痕（它仍
+    // 是签名 payload 的一部分，验签照旧覆盖它）。
     if ('${formatVersion ?? ''}' != supportedFormatVersion) {
       throw StateError(
         '站点库格式版本 ${formatVersion ?? '未知'} 与当前软件支持的 '
         '$supportedFormatVersion 不符，已拒绝',
-      );
-    }
-    if ('${coreVersion ?? ''}' != currentCoreVersion) {
-      throw StateError(
-        '站点库要求核心版本 ${coreVersion ?? '未知'}，'
-        '当前软件版本是 $currentCoreVersion，不匹配，已拒绝',
       );
     }
     return (version: version, count: stationRows.length);
@@ -755,7 +759,7 @@ class SiteLibraryService {
   static SiteLibraryService get instance => _shared;
   static final SiteLibraryService _shared = SiteLibraryService();
 
-  /// 当前软件核心版本（可注入）：库的 core_version 必须等于它。
+  /// 兼容保留字段：取消核心门后不再参与比对（见文件头常量）。
   final String currentCoreVersion;
 
   /// 支持的站点库格式版本：库的 format_version 必须等于它。
@@ -1173,7 +1177,9 @@ class SiteLibraryService {
     _loadRejectionReason = null;
   }
 
-  /// 版本门判定：两边版本都写进中文原因；都对返回 null。
+  /// 版本门判定：格式版本对不上回中文原因；对了返回 null。
+  /// [coreVersion] 自 2026-11-28 取消核心门后不再比对（用户
+  /// 令），保留参数兼容旧调用点，传什么都不影响结果。
   String? _versionRejection({
     required Object? formatVersion,
     required Object? coreVersion,
@@ -1181,10 +1187,6 @@ class SiteLibraryService {
     if ('${formatVersion ?? ''}' != supportedFormatVersion) {
       return '站点库格式版本 ${formatVersion ?? '未知'} 与当前软件支持的 '
           '$supportedFormatVersion 不符';
-    }
-    if ('${coreVersion ?? ''}' != currentCoreVersion) {
-      return '站点库要求核心版本 ${coreVersion ?? '未知'}，'
-          '当前软件版本是 $currentCoreVersion，不匹配';
     }
     return null;
   }

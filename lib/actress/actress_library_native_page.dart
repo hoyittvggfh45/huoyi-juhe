@@ -32,6 +32,7 @@ import 'package:flutter/material.dart';
 
 import 'actress_adapter_repository.dart';
 import 'actress_db_manage_page.dart';
+import 'actress_db_source.dart';
 import 'actress_adapter_store.dart';
 import 'actress_avatar.dart';
 import 'actress_javdb_api.dart' show JavdbApiClient;
@@ -262,6 +263,20 @@ class _ActressLibraryNativePageState extends State<ActressLibraryNativePage> {
     for (final source in _browsableSources) source.id: _OnlineState(),
   };
 
+  // ---- 外置兜底态（未激活＋外置库结构过关时为真） ----
+  var _fallbackActive = false;
+
+  Future<void> _refreshFallbackFlag() async {
+    try {
+      final status = await ActressDbSource.instance.status();
+      if (mounted && status.fallbackActive != _fallbackActive) {
+        setState(() => _fallbackActive = status.fallbackActive);
+      }
+    } catch (_) {
+      // 状态读不到不挡页面：横幅不显示即可。
+    }
+  }
+
   // ---- 搜索态 ----
   var _searching = false;
   var _searchSections = <_SearchSection>[];
@@ -290,6 +305,7 @@ class _ActressLibraryNativePageState extends State<ActressLibraryNativePage> {
     }
     unawaited(_loadLocal(reset: true));
     unawaited(_loadMagnetCategories());
+    unawaited(_refreshFallbackFlag());
     final searchQuery = widget.initialSearchQuery?.trim() ?? '';
     if (searchQuery.isNotEmpty) {
       _searchController.text = searchQuery;
@@ -888,6 +904,7 @@ class _ActressLibraryNativePageState extends State<ActressLibraryNativePage> {
 
   Future<void> _reloadLocalSource() async {
     await _bind.ensureBound(refresh: true);
+    unawaited(_refreshFallbackFlag());
     if (!mounted) return;
     // 换新兜底实例：旧实例可能还握着旧库连接/旧文件戳。
     setState(() => _fallback = ActressLibraryDbFallback());
@@ -1135,6 +1152,17 @@ class _ActressLibraryNativePageState extends State<ActressLibraryNativePage> {
         child: Column(
           children: [
             _topBar(),
+            if (_fallbackActive)
+              Container(
+                key: const ValueKey('native-fallback-banner'),
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+                color: Neon.surface,
+                child: const Text(
+                  '导入未成功，当前使用外置库兜底（只读）',
+                  style: TextStyle(color: Neon.cyan, fontSize: 12),
+                ),
+              ),
             _searchRow(),
             if (_searching)
               Expanded(child: _searchBody())

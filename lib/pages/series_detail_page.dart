@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../actress/actress_widgets.dart';
 import '../actress/code_meta_section.dart';
@@ -1354,6 +1355,9 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
                   // 信息卡（番号补全）：站源卡片之后、选集之前；
                   // 整卡无任何行时不画。
                   ..._filmInfoCardBlock(),
+                  // 磁力区（番号补全的磁力项）：库里这个番号挂
+                  // 有磁力才画，信息卡之后、选集之前。
+                  ..._filmMagnetBlock(),
                 ],
               ),
             ),
@@ -1528,6 +1532,85 @@ class _SeriesDetailPageState extends State<SeriesDetailPage> {
               ),
             ),
         ],
+      ),
+    ];
+  }
+
+  /// 磁力区（2026-11-28 验收线：片库作品按番号反查到磁力就
+  /// 要显示）：数据只认补全服务从女优库 detail 带回的
+  /// magnetUrls 全量，库里没有就是不画、不编造。逐条列出，
+  /// 点按复制链接；115 离线播放在演员库作品详情里走（同一
+  /// 番号），这里只做显示与复制，不另接播放链。
+  List<Widget> _filmMagnetBlock() {
+    final magnets = _fill?.magnets ?? const <String>[];
+    if (magnets.isEmpty) return const [];
+    return [
+      const SizedBox(height: 12),
+      Container(
+        key: const ValueKey('film-detail-db-magnets'),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: moyiCardDecoration(radius: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '磁力链接（女优库）',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '这个番号在女优库里挂有磁力，点按任意一条复制链接；'
+              '要走 115 网盘播放，去演员库打开这部作品。',
+              style: TextStyle(fontSize: 12, height: 1.5, color: Colors.white54),
+            ),
+            for (var i = 0; i < magnets.length; i++)
+              InkWell(
+                key: ValueKey('film-detail-db-magnet-$i'),
+                onTap: () async {
+                  await Clipboard.setData(ClipboardData(text: magnets[i]));
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('磁力链接已复制')),
+                  );
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.cloud_download_outlined,
+                        size: 16,
+                        color: Colors.white54,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          magnets[i],
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12.5,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Icon(
+                        Icons.copy_outlined,
+                        size: 15,
+                        color: Colors.white54,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     ];
   }

@@ -11,14 +11,20 @@ import 'actress_database.dart' show applyActressDbReadPragmas;
 ///
 /// - 版本字段住在库内 `schema_meta` 表（key/value）：
 ///   `format`（女优库恒为 `actress_library`）、`format_version`
-///   （库格式版本）、`core_version`（本库要求的核心版本）、
+///   （库格式版本）、`core_version`（本库自报的核心版本）、
 ///   `library_version`（库自身版本，仅展示/留痕，不参与比对）；
-/// - 比对口径与站点库一致：**精确相等**——format_version 必须
-///   等于 [actressLibrarySupportedFormatVersion]，core_version
-///   必须等于 [actressLibraryDefaultCoreVersion]（均可注入覆盖，
-///   测试/将来升版用）；
-/// - 缺表/缺字段、对不上，一律拒收并给中文原因（写明库要求什么、
-///   当前软件是什么），已激活的旧库一字不动（调用方保证）。
+/// - 比对口径：format_version 必须等于
+///   [actressLibrarySupportedFormatVersion]（可注入覆盖，测试/
+///   将来升版用）；
+/// - **核心版本不设门（2026-11-28 13:25 用户令「取消这个」）**：
+///   core_version 带不带、写什么值，都不许据此拒收——它只作
+///   记录随激活信息留痕，不参与任何比对；管理页也不再显示
+///   「要求核心」。结构校验（表在不在、作品数）照旧，结构真
+///   坏了才拒；
+/// - 缺版本字段（无 schema_meta / format 不对 / 缺
+///   format_version）、格式版本对不上，仍拒收并给中文原因，
+///   已激活的旧库一字不动（调用方保证）。外置库纯缺字段的存
+///   量放行口径不变（见 actress_db_import.dart）。
 ///
 /// 存量口径（同批定版）：版本门只管**新导入**。升级前导入槽里
 /// 已经在用的库（没有版本字段）视为存量继续可用，激活记录记
@@ -28,7 +34,8 @@ import 'actress_database.dart' show applyActressDbReadPragmas;
 /// 等于它）。
 const actressLibrarySupportedFormatVersion = '1';
 
-/// 本软件的核心版本（schema_meta.core_version 必须等于它）。
+/// 本软件的核心版本（仅留痕：写进激活记录备查，2026-11-28 起
+/// 不再参与任何版本比对，见文件头）。
 const actressLibraryDefaultCoreVersion = '2026.11.27';
 
 /// 女优库 schema_meta 的 format 标识值。
@@ -49,16 +56,17 @@ class ActressLibraryVersionInfo {
   final String libraryVersion;
 
   /// schema_meta 表不存在或 format 不是女优库：视为没有版本字段。
+  /// core_version 不在必需之列（2026-11-28 取消核心门：带不带
+  /// 都不影响判定）。
   bool get hasVersionFields =>
-      format == actressLibraryMetaFormat &&
-      formatVersion.isNotEmpty &&
-      coreVersion.isNotEmpty;
+      format == actressLibraryMetaFormat && formatVersion.isNotEmpty;
 
-  /// 展示用一句话（管理页激活信息）。
+  /// 展示用一句话（管理页激活信息）。核心版本不再显示
+  /// （2026-11-28 用户令：管理页不出现「要求核心」）。
   String get describe {
     if (!hasVersionFields) return '无版本字段（存量库）';
     return '库版本 ${libraryVersion.isEmpty ? '未知' : libraryVersion}'
-        ' · 格式 $formatVersion · 要求核心 $coreVersion';
+        ' · 格式 $formatVersion';
   }
 }
 
@@ -96,7 +104,9 @@ Future<ActressLibraryVersionInfo> readActressLibraryVersion(
 }
 
 /// 版本门判定：通过回 null，不通过回中文拒收原因（写明要求与
-/// 现状）。[supportedFormatVersion] / [currentCoreVersion] 可注入。
+/// 现状）。[supportedFormatVersion] 可注入；[currentCoreVersion]
+/// 自 2026-11-28 取消核心门后不再参与判定，保留参数只是兼容
+/// 旧调用点，传什么都不影响结果。
 String? actressLibraryVersionError(
   ActressLibraryVersionInfo info, {
   String supportedFormatVersion = actressLibrarySupportedFormatVersion,
@@ -105,17 +115,15 @@ String? actressLibraryVersionError(
   if (!info.hasVersionFields) {
     return '这个库没有版本字段，无法激活（多半是旧版库）：'
         '当前软件只认带版本字段的女优库'
-        '（格式版本 $supportedFormatVersion、核心版本 $currentCoreVersion），'
+        '（格式版本 $supportedFormatVersion），'
         '请换用新版库文件再导入';
   }
   if (info.formatVersion != supportedFormatVersion) {
     return '女优库格式版本 ${info.formatVersion} 与当前软件支持的 '
         '格式版本 $supportedFormatVersion 不一致，无法激活';
   }
-  if (info.coreVersion != currentCoreVersion) {
-    return '女优库要求核心版本 ${info.coreVersion}，'
-        '当前软件核心版本是 $currentCoreVersion，版本对不上，无法激活';
-  }
+  // core_version 不比对（2026-11-28 用户令取消核心门）：文件
+  // 带任何核心版本值、或干脆不带，都照常放行。
   return null;
 }
 

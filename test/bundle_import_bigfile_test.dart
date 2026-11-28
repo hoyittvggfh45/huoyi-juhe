@@ -328,10 +328,31 @@ const _bundleSql =
 const _bundleSqlGz =
     '/home/hatch/workspace/xiuxian_bundle_import_crash_20261128/work/fanren_station.sql.gz';
 
+/// Re-chunk a byte stream into events of [sizes] (cycled):
+/// hostile delivery simulation for the fix2 adversarial cases.
+Stream<List<int>> _rechunkForTest(
+  Stream<List<int>> source,
+  List<int> sizes,
+) async* {
+  final buffer = <int>[];
+  var idx = 0;
+  await for (final chunk in source) {
+    buffer.addAll(chunk);
+    while (buffer.length >= sizes[idx % sizes.length]) {
+      final n = sizes[idx % sizes.length];
+      idx++;
+      yield buffer.sublist(0, n);
+      buffer.removeRange(0, n);
+    }
+  }
+  if (buffer.isNotEmpty) yield buffer;
+}
+
 Future<void> _runCase({
   required String label,
   required String sqlPath,
   required String caseDir,
+  Stream<List<int>> Function(Stream<List<int>>)? decodedStreamWrapper,
 }) async {
   final dir = Directory(caseDir);
   if (await dir.exists()) await dir.delete(recursive: true);
@@ -420,6 +441,7 @@ Future<void> _runCase({
       actressLander: actressLander,
       magnetLander: magnetLander,
       segmentDbPostProcess: postProcess,
+      decodedStreamWrapper: decodedStreamWrapper,
     );
     final outcome = await importer.importBundle(
       sqlPath: sqlPath,
@@ -475,6 +497,40 @@ void main() {
       label: 'bundle-raw',
       sqlPath: _bundleSql,
       caseDir: '$_workDir/case_raw',
+    );
+  }, timeout: const Timeout(Duration(minutes: 120)));
+
+  test('bigfile bundle sql (adversarial 30720-byte delivery)', () async {
+    if (!await File(_bundleSql).exists()) {
+      markTestSkipped('fixture missing: $_bundleSql');
+      return;
+    }
+    await _runCase(
+      label: 'bundle-raw-adv30720',
+      sqlPath: _bundleSql,
+      caseDir: '$_workDir/case_raw_adv30720',
+      decodedStreamWrapper: (s) => _rechunkForTest(s, const [30720]),
+    );
+  }, timeout: const Timeout(Duration(minutes: 120)));
+
+  test('bigfile bundle sql (adversarial random delivery)', () async {
+    if (!await File(_bundleSql).exists()) {
+      markTestSkipped('fixture missing: $_bundleSql');
+      return;
+    }
+    // Deterministic pseudo-random sizes (LCG), 1..65536 bytes.
+    var seed = 20261128;
+    int nextSize() {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return 1 + seed % 65536;
+    }
+
+    final sizes = [for (var i = 0; i < 128; i++) nextSize()];
+    await _runCase(
+      label: 'bundle-raw-advrandom',
+      sqlPath: _bundleSql,
+      caseDir: '$_workDir/case_raw_advrandom',
+      decodedStreamWrapper: (s) => _rechunkForTest(s, sizes),
     );
   }, timeout: const Timeout(Duration(minutes: 120)));
 
